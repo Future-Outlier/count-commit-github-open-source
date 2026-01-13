@@ -22,12 +22,11 @@ RUN useradd -ms /bin/bash -g $USER $USER
 USER $USER
 
 # clone repo
+ARG BRANCH=trunk
 ARG REPO=https://github.com/apache/kafka.git
-RUN git clone --depth=1 $REPO /home/$USER/kafka
+RUN git clone --depth=1 -b $BRANCH $REPO /home/$USER/kafka
 WORKDIR /home/$USER/kafka
 
-ARG BRANCH=trunk
 RUN git config pull.rebase false
-RUN git checkout $BRANCH
 
 RUN ./gradlew clean build -x test --no-daemon && ./gradlew clean
