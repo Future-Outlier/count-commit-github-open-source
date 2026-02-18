@@ -23,9 +23,11 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Create MD File from Input
+      - name: Download from URL (考慮使用 https://gist.github.com)
+        if: "${{ inputs.resume_url != '' }}"
         run: |
-          echo "${{ inputs.markdown_content }}" > resume.md
+          echo "正在從 URL 下載 resume.md..."
+          curl -L "${{ inputs.resume_url }}" -o resume.md
 
       - name: Convert Markdown to PDF
         run: |
