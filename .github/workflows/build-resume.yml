@@ -7,6 +7,11 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      markdown_content:
+        description: '請貼上你的 Markdown 內容'
+        required: true
+        type: string # 這裡只能是 string
 
 jobs:
   build-pdf:
@@ -17,6 +22,11 @@ jobs:
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
+
+      - name: Create MD File from Input
+        run: |
+          # 把輸入的文字寫入檔案
+          echo "${{ inputs.markdown_content }}" > resume.md
 
       - name: Convert Markdown to PDF
         run: |
