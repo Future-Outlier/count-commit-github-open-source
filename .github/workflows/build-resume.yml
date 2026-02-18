@@ -8,10 +8,10 @@ on:
       - main
   workflow_dispatch:
     inputs:
-      markdown_content:
-        description: '請貼上你的 Markdown 內容'
+      resume_url:
+        description: '請貼上 resume.md 的 Raw URL (Gist 或其他)'
         required: true
-        type: string # 這裡只能是 string
+        type: string
 
 jobs:
   build-pdf:
@@ -23,7 +23,7 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Download from URL (考慮使用 https://gist.github.com)
+      - name: Download from URL
         if: "${{ inputs.resume_url != '' }}"
         run: |
           echo "正在從 URL 下載 resume.md..."
