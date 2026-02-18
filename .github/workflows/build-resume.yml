@@ -25,7 +25,6 @@ jobs:
 
       - name: Create MD File from Input
         run: |
-          # 把輸入的文字寫入檔案
           echo "${{ inputs.markdown_content }}" > resume.md
 
       - name: Convert Markdown to PDF
@@ -34,14 +33,11 @@ jobs:
           docker pull ghcr.io/opensource4you/resume:latest
           
           echo "開始轉檔..."
-          # 這裡我們用 -v 把當前目錄掛載到容器內的 /app (或是你容器預設的工作目錄)
-          # 假設你的容器一啟動就會自動尋找目錄下的 .md 並轉檔
-          # 如果你的容器需要下指令，請修改 sh -c 後面的內容
           
           docker run --rm \
             -v ${{ github.workspace }}:/workspace \
             ghcr.io/opensource4you/resume:latest \
-            /bin/sh -c "cp /workspace/resume.md /tmp/quarto-resume-template/resume.md && quarto render resume.qmd --to pdf && cp /tmp/quarto-resume-template/_site/resume.pdf /workspace/"
+            /bin/sh -c "cp /workspace/resume.md /tmp/quarto-resume-template/resume.qmd && quarto render resume.qmd --to pdf && cp /tmp/quarto-resume-template/_site/resume.pdf /workspace/"
           
           echo "檢查 PDF 是否生成..."
           ls -l resume.pdf
