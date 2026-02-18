@@ -1,0 +1,56 @@
+name: Build and Release Resume
+
+on:
+  push:
+    paths:
+      - 'resume.md'
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build-pdf:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Convert Markdown to PDF
+        run: |
+          echo "拉取 Docker映像檔..."
+          docker pull ghcr.io/opensource4you/resume:latest
+          
+          echo "開始轉檔..."
+          # 這裡我們用 -v 把當前目錄掛載到容器內的 /app (或是你容器預設的工作目錄)
+          # 假設你的容器一啟動就會自動尋找目錄下的 .md 並轉檔
+          # 如果你的容器需要下指令，請修改 sh -c 後面的內容
+          
+          docker run --rm \
+            -v ${{ github.workspace }}:/workspace \
+            ghcr.io/opensource4you/resume:latest \
+            /bin/sh -c "cp /workspace/resume.md /tmp/quarto-resume-template/resume.md && quarto render resume.qmd --to pdf && cp /tmp/quarto-resume-template/_site/resume.pdf /workspace/"
+          
+          echo "檢查 PDF 是否生成..."
+          ls -l resume.pdf
+
+      - name: Upload PDF Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: resume-pdf
+          path: resume.pdf
+          retention-days: 5
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        if: github.ref == 'refs/heads/main'
+        with:
+          tag_name: resume-${{ github.run_number }}
+          name: Resume Build ${{ github.run_number }}
+          files: resume.pdf
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
