@@ -5,7 +5,7 @@ pipeline {
     parameters {
         choice(
             name: 'JDK_VERSION',
-            choices: ['17-jdk-jammy', '21-jdk-jammy', '11-jdk-jammy'],
+            choices: ['17-jdk-jammy', '21-jdk-jammy', '25-jdk-jammy'],
             description: '請選擇執行測試的 JDK 映像檔版本'
         )
         string(

@@ -1,6 +1,13 @@
 pipeline {
-    agent {
-        label "e2e"
+    agent any
+
+    options {
+        throttleJobProperty(
+            throttleEnabled: true,
+            throttleOption: 'project',
+            maxConcurrentPerNode: 1,   // 關鍵：每個節點同時間最多只能跑 1 個
+            maxConcurrentTotal: 0      // 關鍵：0 代表「總數量無上限」，只要你有 5 個節點，就能同時跑 5 個任務
+        )
     }
 
     // 定義 Pipeline 參數

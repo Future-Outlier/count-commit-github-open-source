@@ -5,9 +5,7 @@ pipeline {
         0 18 * * *''')
     }
 
-    agent {
-        label 'jenkins-worker-2'
-    }
+    agent any
 
     environment {
         // 專案的 Git 網址
