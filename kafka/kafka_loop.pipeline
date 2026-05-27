@@ -64,10 +64,10 @@ pipeline {
                                         // 將 docker run 改為 podman run
                                         sh """
                                             podman run --cpus=3 --rm \
-                                                -v ${env.WORKSPACE}:/tmp/kafka \
-                                                -v ${GRADLE_CACHE_DIR}:/root/.gradle \
+                                                -v ${env.WORKSPACE}:/tmp/kafka:z \
+                                                -v ${GRADLE_CACHE_DIR}:/root/.gradle:z \
                                                 docker.io/library/eclipse-temurin:${params.JDK_VERSION} \
-                                                /bin/bash -c "cd /tmp/kafka && ${params.COMMAND}"
+                                                /bin/bash -c "cd /tmp/kafka && chmod +x ./gradlew && ${params.COMMAND}"
                                         """
                                     }
                                 }
