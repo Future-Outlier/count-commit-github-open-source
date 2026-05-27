@@ -14,7 +14,7 @@ pipeline {
     parameters {
         string(name: 'ACCOUNT', defaultValue: 'apache', description: 'GitHub 帳號或組織名稱 (例如: apache, 你的帳號)')
         string(name: 'REVISION', defaultValue: 'trunk', description: '要測試的 Git 分支、標籤或 Commit Hash')
-        string(name: 'TC_PATHS', defaultValue: 'tests/kafkatest/tests', description: '要執行的 Ducktape 測試路徑 (若留空則執行全部測試，例如: tests/kafkatest/tests/core/...)')
+        string(name: 'TC_PATHS', defaultValue: 'tests/kafkatest/tests/tools', description: '要執行的 Ducktape 測試路徑 (若留空則執行全部測試，例如: tests/kafkatest/tests/core/...)')
     }
 
     stages {
