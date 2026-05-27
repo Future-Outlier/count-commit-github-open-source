@@ -20,7 +20,7 @@ pipeline {
         )
         string(
             name: 'COMMAND',
-            defaultValue: './gradlew clean test',
+            defaultValue: './gradlew clean metadata:test',
             description: '請輸入要執行的測試指令'
         )
     }
