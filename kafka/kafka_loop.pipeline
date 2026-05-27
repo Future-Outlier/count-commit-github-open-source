@@ -46,7 +46,8 @@ pipeline {
                             cleanWs()
                             sh "hostname"
 
-                            sh "docker pull docker.io/library/eclipse-temurin:${params.JDK_VERSION}"
+                            // 將 docker pull 改為 podman pull
+                            sh "podman pull docker.io/library/eclipse-temurin:${params.JDK_VERSION}"
 
                             sh "git init"
                             sh "git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 https://github.com/${params.ACCOUNT}/kafka +${params.REVISION}:tmp"
@@ -60,12 +61,13 @@ pipeline {
                             script {
                                 for (int i = 1; i <= 20; i++) {
                                     warnError("Test run ${i} failed in container ${CONTAINER_ID}") {
+                                        // 將 docker run 改為 podman run
                                         sh """
-                                        docker run --cpus=3 --rm \
-                                            -v ${env.WORKSPACE}:/tmp/kafka \
-                                            -v ${GRADLE_CACHE_DIR}:/root/.gradle \
-                                            docker.io/library/eclipse-temurin:${params.JDK_VERSION} \
-                                            /bin/bash -c "cd /tmp/kafka && ${params.COMMAND}"
+                                            podman run --cpus=3 --rm \
+                                                -v ${env.WORKSPACE}:/tmp/kafka \
+                                                -v ${GRADLE_CACHE_DIR}:/root/.gradle \
+                                                docker.io/library/eclipse-temurin:${params.JDK_VERSION} \
+                                                /bin/bash -c "cd /tmp/kafka && ${params.COMMAND}"
                                         """
                                     }
                                 }
