@@ -1,31 +1,38 @@
 pipeline {
-    // 1. 關鍵：拔除頂層 agent，改為 none，延後分配節點
+    // 1. 頂層設為 none，一開始啟動時不要搶佔節點
     agent none
 
-    // 定義 Pipeline 參數 (保持不變)
     parameters {
         string(name: 'ACCOUNT', defaultValue: 'apache', description: 'GitHub 帳號或組織名稱 (例如: apache, 你的帳號)')
         string(name: 'REVISION', defaultValue: 'trunk', description: '要測試的 Git 分支、標籤或 Commit Hash')
         string(name: 'TC_PATHS', defaultValue: 'tests/kafkatest/tests/tools', description: '要執行的 Ducktape 測試路徑 (若留空則執行全部測試，例如: tests/kafkatest/tests/core/...)')
     }
 
-    // 這裡的 options 可以刪除了，因為寫在這裡沒用
-
     stages {
-        stage('Throttled Execution') {
-            steps {
-                // 2. 關鍵：使用 throttle 步驟包裝，讓外掛能在分配節點前介入排隊
-                throttle(['kafka_one_per_node']) {
+        // 2. 建立一個 "外層 Stage" 來做控管
+        stage('Kafka E2E Execution') {
 
-                    // 3. 關鍵：在這裡才分配節點 (等同於隨機挑選節點的 agent any)
-                    node {
+            // 3. 在這個外層 Stage 才宣告 agent，任務排到隊後才會去拿 worker 節點
+            agent any
 
-                        // 4. 將原本的 stages 轉換成這種簡化的寫法
-                        stage('clean results') {
-                            sh "rm -rf kafka/results"
-                        }
+            // 4. 將 throttle 選項放在這個 Stage 的 options 裡
+            options {
+                // Declarative 的內建語法，更簡潔，且能正確綁定在這個階段
+                throttle(['kafka_one_per_node'])
+            }
 
-                        stage('down containers') {
+            // 5. 巢狀 Stages 開始：所有原本的步驟都包在這裡面
+            stages {
+                stage('clean results') {
+                    steps {
+                        sh "rm -rf kafka/results"
+                    }
+                }
+
+                stage('down containers') {
+                    steps {
+                        // 邏輯判斷必須包在 script 區塊內
+                        script {
                             if (fileExists('kafka/tests/docker/ducker-ak')) {
                                 dir("kafka") {
                                     sh "./tests/docker/ducker-ak down -f"
@@ -34,54 +41,69 @@ pipeline {
                                 echo "Kafka directory or ducker-ak script not found. Skipping down containers."
                             }
                         }
+                    }
+                }
 
-                        stage('who am i') {
-                            sh "hostname"
+                stage('who am i') {
+                    steps {
+                        sh "hostname"
+                    }
+                }
+
+                stage('clone code') {
+                    steps {
+                        dir("kafka") {
+                            deleteDir()
+                            sh "git init && git remote add origin https://github.com/${params.ACCOUNT}/kafka"
+                            sh "git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 origin +${params.REVISION}:${params.REVISION}"
+                            sh "git switch ${params.REVISION}"
                         }
+                    }
+                }
 
-                        stage('clone code') {
-                            dir("kafka") {
-                                deleteDir()
-                                sh "git init && git remote add origin https://github.com/${params.ACCOUNT}/kafka"
-                                sh "git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 origin +${params.REVISION}:${params.REVISION}"
-                                sh "git switch ${params.REVISION}"
-                            }
+                stage('build code') {
+                    steps {
+                        dir("kafka") {
+                            sh "./gradlew clean build -x test --build-cache"
                         }
+                    }
+                }
 
-                        stage('build code') {
-                            dir("kafka") {
-                                sh "./gradlew clean build -x test --build-cache"
-                            }
-                        }
-
-                        stage('run tests') {
-                            dir("kafka") {
+                stage('run tests') {
+                    steps {
+                        dir("kafka") {
+                            // 變數賦值必須包在 script 區塊內
+                            script {
                                 TAG = sh(returnStdout: true, script: 'git rev-parse --short HEAD').trim()
+                            }
 
-                                withEnv([
-                                    "KAFKA_NUM_CONTAINERS=100",
-                                    "_DUCKTAPE_OPTIONS=--max-parallel 10",
-                                    "jdk_version=docker.io/library/eclipse-temurin:17-jdk-jammy"
-                                ]) {
-                                    warnError('test fails') {
-                                        sh "image_name=ducker-ak:${TAG} ./tests/docker/run_tests.sh ${params.TC_PATHS}"
-                                    }
+                            withEnv([
+                                "KAFKA_NUM_CONTAINERS=100",
+                                "_DUCKTAPE_OPTIONS=--max-parallel 10",
+                                "jdk_version=docker.io/library/eclipse-temurin:17-jdk-jammy"
+                            ]) {
+                                warnError('test fails') {
+                                    sh "image_name=ducker-ak:${TAG} ./tests/docker/run_tests.sh ${params.TC_PATHS}"
                                 }
                             }
                         }
+                    }
+                }
 
-                        stage('archive results') {
-                            dir("kafka") {
+                stage('archive results') {
+                    steps {
+                        dir("kafka") {
+                            // 邏輯判斷必須包在 script 區塊內
+                            script {
                                 if (fileExists('results')) {
                                     sh "zip -r results.zip results"
                                     archiveArtifacts artifacts: "results/*/report.txt,results.zip"
                                 }
                             }
                         }
-
-                    } // node 結束
-                } // throttle 結束
-            }
-        }
+                    }
+                }
+            } // 巢狀 Stages 結束
+        } // 外層控管 Stage 結束
     }
 }
