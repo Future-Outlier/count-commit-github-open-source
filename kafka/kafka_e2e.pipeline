@@ -17,7 +17,7 @@ pipeline {
 
             // 4. 將 throttle 選項放在這個 Stage 的 options 裡
             options {
-                // Declarative 的內建語法，更簡潔，且能正確綁定在這個階段
+                // 限制這個節點同時間只能跑一個 Kafka 任務
                 throttle(['kafka_one_per_node'])
             }
 
@@ -72,18 +72,48 @@ pipeline {
                 stage('run tests') {
                     steps {
                         dir("kafka") {
-                            // 變數賦值必須包在 script 區塊內
+                            // 變數賦值與邏輯運算包在 script 區塊內
                             script {
-                                TAG = sh(returnStdout: true, script: 'git rev-parse --short HEAD').trim()
-                            }
+                                // 1. 取得 Git Hash 作為 Image Tag
+                                def TAG = sh(returnStdout: true, script: 'git rev-parse --short HEAD').trim()
 
-                            withEnv([
-                                "KAFKA_NUM_CONTAINERS=100",
-                                "_DUCKTAPE_OPTIONS=--max-parallel 10",
-                                "jdk_version=docker.io/library/eclipse-temurin:17-jdk-jammy"
-                            ]) {
-                                warnError('test fails') {
-                                    sh "image_name=ducker-ak:${TAG} ./tests/docker/run_tests.sh ${params.TC_PATHS}"
+                                // 2. 透過 Linux 指令 `free -m` 取得總實體記憶體大小 (以 MB 為單位)
+                                def totalMemMbStr = sh(returnStdout: true, script: "free -m | awk '/^Mem:/{print \$2}'").trim()
+                                def totalMemMb = totalMemMbStr.toInteger()
+
+                                // 3. 設定參數 (以 MB 為單位)
+                                def containerRamMb = 2048 // 每個容器抓 2GB (2048 MB)
+                                def reservedMemMb = 4096  // 預留 4GB 給系統與 Jenkins Agent 運行
+
+                                // 4. 計算可用記憶體與容器數量
+                                def availableMemMb = totalMemMb - reservedMemMb
+
+                                // 防呆機制：如果可用記憶體不足，至少保底為 0
+                                if (availableMemMb < 0) availableMemMb = 0
+
+                                def calculatedContainers = (availableMemMb / containerRamMb).toInteger()
+
+                                // 確保至少會有 14 個容器
+                                def numContainers = Math.max(14, calculatedContainers)
+
+                                // 將計算過程印出到 Jenkins Console Log 中，方便確認
+                                echo "=== 資源動態分配結果 ==="
+                                echo "Host 總記憶體 : ${totalMemMb} MB"
+                                echo "系統預留保留  : ${reservedMemMb} MB"
+                                echo "可用於測試    : ${availableMemMb} MB"
+                                echo "計算出容器數量: ${numContainers} (單一容器估計 ${containerRamMb} MB)"
+                                echo "======================"
+
+                                // 5. 將動態算出的容器數量帶入環境變數
+                                withEnv([
+                                    "KAFKA_NUM_CONTAINERS=${numContainers}",
+                                    // 依據容器數量動態設定 max-parallel (最高給到 10，但如果容器不夠則降下來)
+                                    "_DUCKTAPE_OPTIONS=--max-parallel ${numContainers >= 10 ? 10 : numContainers}",
+                                    "jdk_version=docker.io/library/eclipse-temurin:17-jdk-jammy"
+                                ]) {
+                                    warnError('test fails') {
+                                        sh "image_name=ducker-ak:${TAG} ./tests/docker/run_tests.sh ${params.TC_PATHS}"
+                                    }
                                 }
                             }
                         }
