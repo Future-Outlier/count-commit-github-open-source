@@ -1,95 +1,86 @@
 pipeline {
-    agent any
+    // 1. 關鍵：拔除頂層 agent，改為 none，延後分配節點
+    agent none
 
-    options {
-        throttleJobProperty(
-            throttleEnabled: true,
-            throttleOption: 'category',          // 關鍵 1：模式必須改為 'category'
-            categories: ['kafka_one_per_node']   // 關鍵 2：填寫你在系統設定中建立的類別名稱
-        )
-    }
-
-    // 定義 Pipeline 參數
+    // 定義 Pipeline 參數 (保持不變)
     parameters {
         string(name: 'ACCOUNT', defaultValue: 'apache', description: 'GitHub 帳號或組織名稱 (例如: apache, 你的帳號)')
         string(name: 'REVISION', defaultValue: 'trunk', description: '要測試的 Git 分支、標籤或 Commit Hash')
         string(name: 'TC_PATHS', defaultValue: 'tests/kafkatest/tests/tools', description: '要執行的 Ducktape 測試路徑 (若留空則執行全部測試，例如: tests/kafkatest/tests/core/...)')
     }
 
+    // 這裡的 options 可以刪除了，因為寫在這裡沒用
+
     stages {
-        stage('clean results') {
+        stage('Throttled Execution') {
             steps {
-                sh "rm -rf kafka/results"
-            }
-        }
-        stage('down containers') {
-            steps {
-                script {
-                    if (fileExists('kafka/tests/docker/ducker-ak')) {
-                        dir("kafka") {
-                            sh "./tests/docker/ducker-ak down -f"
+                // 2. 關鍵：使用 throttle 步驟包裝，讓外掛能在分配節點前介入排隊
+                throttle(['kafka_one_per_node']) {
+
+                    // 3. 關鍵：在這裡才分配節點 (等同於隨機挑選節點的 agent any)
+                    node {
+
+                        // 4. 將原本的 stages 轉換成這種簡化的寫法
+                        stage('clean results') {
+                            sh "rm -rf kafka/results"
                         }
-                    } else {
-                        echo "Kafka directory or ducker-ak script not found. Skipping down containers."
-                    }
-                }
-            }
-        }
-        stage('who am i') {
-            steps {
-                sh "hostname"
-            }
-        }
-        stage('clone code') {
-            steps {
-                dir("kafka") {
-                    deleteDir()
-                    // 使用 ${params.ACCOUNT} 與 ${params.REVISION} 替換原本寫死的變數
-                    sh "git init && git remote add origin https://github.com/${params.ACCOUNT}/kafka"
-                    sh "git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 origin +${params.REVISION}:${params.REVISION}"
-                    sh "git switch ${params.REVISION}"
-                }
-            }
-        }
-        stage('build code') {
-            steps {
-                dir("kafka") {
-                    sh "./gradlew clean build -x test --build-cache"
-                }
-            }
-        }
-        stage('run tests') {
-            steps {
-                dir("kafka") {
-                    script {
-                        // 加上 .trim() 確保 tag 不會帶有換行字元
-                        TAG = sh(returnStdout: true, script: 'git rev-parse --short HEAD').trim()
-                    }
-                    // 替換為 Ducktape 自己的平行機制參數
-                    withEnv([
-                        "KAFKA_NUM_CONTAINERS=100",
-                        "_DUCKTAPE_OPTIONS=--max-parallel 10",
-                        "jdk_version=docker.io/library/eclipse-temurin:17-jdk-jammy"
-                    ]) {
-                        warnError('test fails') {
-                            // 將 ${params.TC_PATHS} 附加在腳本後方，以傳入特定測試路徑
-                            sh "image_name=ducker-ak:${TAG} ./tests/docker/run_tests.sh ${params.TC_PATHS}"
+
+                        stage('down containers') {
+                            if (fileExists('kafka/tests/docker/ducker-ak')) {
+                                dir("kafka") {
+                                    sh "./tests/docker/ducker-ak down -f"
+                                }
+                            } else {
+                                echo "Kafka directory or ducker-ak script not found. Skipping down containers."
+                            }
                         }
-                    }
-                }
-            }
-        }
-        stage('archive results') {
-            steps {
-                dir("kafka") {
-                    script {
-                        if (fileExists('results')) {
-                            // 移除 SUBSET 變數，直接打包預設的 results 目錄
-                            sh "zip -r results.zip results"
-                            archiveArtifacts artifacts: "results/*/report.txt,results.zip"
+
+                        stage('who am i') {
+                            sh "hostname"
                         }
-                    }
-                }
+
+                        stage('clone code') {
+                            dir("kafka") {
+                                deleteDir()
+                                sh "git init && git remote add origin https://github.com/${params.ACCOUNT}/kafka"
+                                sh "git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 origin +${params.REVISION}:${params.REVISION}"
+                                sh "git switch ${params.REVISION}"
+                            }
+                        }
+
+                        stage('build code') {
+                            dir("kafka") {
+                                sh "./gradlew clean build -x test --build-cache"
+                            }
+                        }
+
+                        stage('run tests') {
+                            dir("kafka") {
+                                TAG = sh(returnStdout: true, script: 'git rev-parse --short HEAD').trim()
+
+                                withEnv([
+                                    "KAFKA_NUM_CONTAINERS=100",
+                                    "_DUCKTAPE_OPTIONS=--max-parallel 10",
+                                    "jdk_version=docker.io/library/eclipse-temurin:17-jdk-jammy"
+                                ]) {
+                                    warnError('test fails') {
+                                        sh "image_name=ducker-ak:${TAG} ./tests/docker/run_tests.sh ${params.TC_PATHS}"
+                                    }
+                                }
+                            }
+                        }
+
+                        stage('archive results') {
+                            dir("kafka") {
+                                if (fileExists('results')) {
+                                    sh "zip -r results.zip results"
+                                    archiveArtifacts artifacts: "results/*/report.txt,results.zip"
+                                }
+                            }
+                        }
+
+                    } // node 結束
+                } // throttle 結束
             }
         }
     }
