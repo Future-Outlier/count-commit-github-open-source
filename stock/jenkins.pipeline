@@ -10,6 +10,7 @@ pipeline {
     // 2. 設定失敗重試機制
     options {
         retry(5) // 如果執行失敗，最多自動重試 5 次
+        timestamps() // 加入這行，Jenkins 會自動幫所有輸出加上時間
     }
 
     environment {
