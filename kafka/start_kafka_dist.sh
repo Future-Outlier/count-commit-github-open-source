@@ -68,7 +68,7 @@ echo "正在產生 KRaft Cluster ID..."
 CLUSTER_ID=$("$KAFKA_HOME/bin/kafka-storage.sh" random-uuid)
 echo "Cluster ID: $CLUSTER_ID"
 
-# 5. 組合 Controller Quorum Voters 字串 (全部指向 localhost 的獨立 Port)
+# 5. 組合 Controller Quorum Voters 字串 (內部溝通皆綁定 localhost 的獨立 Port)
 VOTERS=""
 for i in $(seq 1 $CONTROLLERS); do
   CTRL_PORT=$((19080 + i))
@@ -119,6 +119,16 @@ sleep 3
 
 # 8. 啟動 Brokers (Ports: 19091, 19092...)
 echo "==== 準備啟動 $BROKERS 個 Brokers ===="
+
+# 自動取得本機對外的 IP (適用於大多數 Linux)
+HOST_ADDRESS=$(hostname -I 2>/dev/null | awk '{print $1}')
+if [[ -z "$HOST_ADDRESS" ]]; then
+  HOST_ADDRESS="127.0.0.1" # 如果抓不到，退回到 localhost 安全模式
+  echo "警告: 無法偵測外部 IP，Broker 將回退使用 127.0.0.1 作為對外廣播位址。"
+else
+  echo "偵測到本機對外位址為: $HOST_ADDRESS，將設定為 advertised.listeners"
+fi
+
 for i in $(seq 1 $BROKERS); do
   node_id=$((CONTROLLERS + i))
   CONF_FILE="$CONFIGS_DIR/broker-$i.properties"
@@ -130,9 +140,10 @@ process.roles=broker
 node.id=$node_id
 controller.quorum.voters=$VOTERS
 controller.listener.names=CONTROLLER
-# 本機啟動不需區分內外網，單一 PLAINTEXT 即可
-listeners=PLAINTEXT://localhost:$BROKER_PORT
-advertised.listeners=PLAINTEXT://localhost:$BROKER_PORT
+# 讓 Kafka 監聽所有網卡介面 (0.0.0.0)
+listeners=PLAINTEXT://0.0.0.0:$BROKER_PORT
+# 告訴外部 Client 用這台機器的實際 IP 來連線
+advertised.listeners=PLAINTEXT://$HOST_ADDRESS:$BROKER_PORT
 log.dirs=$NODE_DATA_DIR
 EOF
   append_custom_configs "$BROKER_CONFIGS" "$CONF_FILE"
@@ -143,15 +154,17 @@ EOF
   # 設定專屬的 JMX Port 並在背景啟動
   BROKER_JMX_PORT=$((9990 + i))
   JMX_PORT=$BROKER_JMX_PORT nohup "$KAFKA_HOME/bin/kafka-server-start.sh" "$CONF_FILE" > "$LOGS_DIR/broker-$i.log" 2>&1 &
-  echo "已在背景啟動 broker-$i (Node ID: $node_id, Port: $BROKER_PORT, JMX: $BROKER_JMX_PORT, 日誌: $LOGS_DIR/broker-$i.log)"
+  echo "已在背景啟動 broker-$i (Node ID: $node_id, 對外 Port: $BROKER_PORT, JMX: $BROKER_JMX_PORT)"
 done
 
 echo "==== 啟動完成！ ===="
 echo "本次執行的資料與配置皆已放置於: $RUN_WORKSPACE"
-echo "--- 本機端連線資訊 ---"
-echo "Brokers 端點: localhost:19091, localhost:19092 ..."
-echo "Brokers JMX:  localhost:9991, localhost:9992 ..."
+echo "--- 外部 Client 連線資訊 ---"
+echo "Brokers 端點: $HOST_ADDRESS:19091, $HOST_ADDRESS:19092 ..."
+echo "Brokers JMX:  $HOST_ADDRESS:9991, $HOST_ADDRESS:9992 ..."
+echo "--- 內部與 Controller 資訊 ---"
 echo "Controllers 端點: localhost:19081, localhost:19082 ..."
 echo "Controllers JMX:  localhost:9981, localhost:9982 ..."
 echo ""
 echo "若要查看服務啟動狀況，請檢查: $LOGS_DIR 底下的 log 檔案。"
+echo "再次啟動前，請確保使用 'pkill -f kafka.Kafka' 指令清除舊的行程，避免 Port 被佔用。"
