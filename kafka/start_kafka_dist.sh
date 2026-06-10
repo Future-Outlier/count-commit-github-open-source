@@ -25,8 +25,8 @@ if [[ $CONTROLLERS -le 0 || $BROKERS -le 0 ]]; then
   exit 1
 fi
 
-if [[ -z "$DIST_FILE" || ! -f "$DIST_FILE" ]]; then
-  echo "錯誤: 必須使用 --distribution 指定有效的 Kafka 壓縮檔 (例如 kafka_2.13-3.7.0.tgz)。"
+if [[ -n "$DIST_FILE" && ! -f "$DIST_FILE" ]]; then
+  echo "錯誤: 找不到指定的 Kafka 壓縮檔 $DIST_FILE"
   exit 1
 fi
 
@@ -35,21 +35,33 @@ if ! command -v java &> /dev/null; then
     exit 1
 fi
 
-# 3. 準備 /tmp 下的工作環境與解壓縮
-WORKSPACE="/tmp/kafka_workspace"
-KAFKA_HOME="$WORKSPACE/kafka"
-CONFIGS_DIR="$WORKSPACE/configs"
-DATA_DIR="$WORKSPACE/data"
-LOGS_DIR="$WORKSPACE/logs" # 用來存放 nohup 背景執行的輸出日誌
+# 3. 準備工作環境 (加入時間戳記來隔離每次的啟動)
+BASE_WORKSPACE="/tmp/kafka_workspace"
+RUN_ID=$(date +"%Y%m%d_%H%M%S")
+RUN_WORKSPACE="$BASE_WORKSPACE/run_$RUN_ID"
 
-echo "==== 準備 Kafka 工作環境 (於 /tmp) ===="
+KAFKA_HOME="$BASE_WORKSPACE/kafka" # 共用同一套 Kafka 主程式以節省解壓縮時間
+CONFIGS_DIR="$RUN_WORKSPACE/configs"
+DATA_DIR="$RUN_WORKSPACE/data"
+LOGS_DIR="$RUN_WORKSPACE/logs"
+
+echo "==== 準備 Kafka 工作環境 ===="
 mkdir -p "$CONFIGS_DIR" "$DATA_DIR" "$LOGS_DIR"
+
+# 檢查是否需要解壓縮
 if [ ! -f "$KAFKA_HOME/bin/kafka-server-start.sh" ]; then
+  if [[ -z "$DIST_FILE" ]]; then
+    echo "錯誤: 尚未建立 Kafka 主程式，必須使用 --distribution 指定壓縮檔以進行初始化。"
+    exit 1
+  fi
   echo "正在解壓縮 $DIST_FILE 至 $KAFKA_HOME ..."
   mkdir -p "$KAFKA_HOME"
   tar -xzf "$DIST_FILE" -C "$KAFKA_HOME" --strip-components=1
+else
+  echo "發現已解壓縮的 Kafka 主程式，將直接重複使用: $KAFKA_HOME"
 fi
-echo "工作環境準備完畢: $WORKSPACE"
+
+echo "本次執行的專屬工作目錄: $RUN_WORKSPACE"
 
 # 4. 取得 KRaft Cluster ID (使用本機 Java 執行)
 echo "正在產生 KRaft Cluster ID..."
@@ -96,9 +108,10 @@ EOF
   # 格式化儲存目錄
   "$KAFKA_HOME/bin/kafka-storage.sh" format -t "$CLUSTER_ID" -c "$CONF_FILE" > /dev/null
 
-  # 在背景啟動並將輸出導向日誌檔
-  nohup "$KAFKA_HOME/bin/kafka-server-start.sh" "$CONF_FILE" > "$LOGS_DIR/controller-$i.log" 2>&1 &
-  echo "已在背景啟動 controller-$i (Port: $CTRL_PORT, 日誌: $LOGS_DIR/controller-$i.log)"
+  # 設定專屬的 JMX Port 並在背景啟動
+  CTRL_JMX_PORT=$((9980 + i))
+  JMX_PORT=$CTRL_JMX_PORT nohup "$KAFKA_HOME/bin/kafka-server-start.sh" "$CONF_FILE" > "$LOGS_DIR/controller-$i.log" 2>&1 &
+  echo "已在背景啟動 controller-$i (Port: $CTRL_PORT, JMX: $CTRL_JMX_PORT, 日誌: $LOGS_DIR/controller-$i.log)"
 done
 
 # 等待 Controller 初始化
@@ -127,16 +140,18 @@ EOF
   # 格式化儲存目錄
   "$KAFKA_HOME/bin/kafka-storage.sh" format -t "$CLUSTER_ID" -c "$CONF_FILE" > /dev/null
 
-  # 在背景啟動並將輸出導向日誌檔
-  nohup "$KAFKA_HOME/bin/kafka-server-start.sh" "$CONF_FILE" > "$LOGS_DIR/broker-$i.log" 2>&1 &
-  echo "已在背景啟動 broker-$i (Node ID: $node_id, Port: $BROKER_PORT, 日誌: $LOGS_DIR/broker-$i.log)"
+  # 設定專屬的 JMX Port 並在背景啟動
+  BROKER_JMX_PORT=$((9990 + i))
+  JMX_PORT=$BROKER_JMX_PORT nohup "$KAFKA_HOME/bin/kafka-server-start.sh" "$CONF_FILE" > "$LOGS_DIR/broker-$i.log" 2>&1 &
+  echo "已在背景啟動 broker-$i (Node ID: $node_id, Port: $BROKER_PORT, JMX: $BROKER_JMX_PORT, 日誌: $LOGS_DIR/broker-$i.log)"
 done
 
 echo "==== 啟動完成！ ===="
-echo "所有資料與配置皆已放置於: $WORKSPACE"
+echo "本次執行的資料與配置皆已放置於: $RUN_WORKSPACE"
 echo "--- 本機端連線資訊 ---"
 echo "Brokers 端點: localhost:19091, localhost:19092 ..."
+echo "Brokers JMX:  localhost:9991, localhost:9992 ..."
 echo "Controllers 端點: localhost:19081, localhost:19082 ..."
+echo "Controllers JMX:  localhost:9981, localhost:9982 ..."
 echo ""
 echo "若要查看服務啟動狀況，請檢查: $LOGS_DIR 底下的 log 檔案。"
-echo "重開機後 /tmp 將自動清空所有資料與背景行程。"
