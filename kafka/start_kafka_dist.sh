@@ -40,7 +40,7 @@ BASE_WORKSPACE="/tmp/kafka_workspace"
 RUN_ID=$(date +"%Y%m%d_%H%M%S")
 RUN_WORKSPACE="$BASE_WORKSPACE/run_$RUN_ID"
 
-KAFKA_HOME="$BASE_WORKSPACE/kafka" # 共用同一套 Kafka 主程式以節省解壓縮時間
+KAFKA_HOME="$BASE_WORKSPACE/kafka" # 共用同一套 Kafka 主程式位置
 CONFIGS_DIR="$RUN_WORKSPACE/configs"
 DATA_DIR="$RUN_WORKSPACE/data"
 LOGS_DIR="$RUN_WORKSPACE/logs"
@@ -48,35 +48,45 @@ LOGS_DIR="$RUN_WORKSPACE/logs"
 echo "==== 準備 Kafka 工作環境 ===="
 mkdir -p "$CONFIGS_DIR" "$DATA_DIR" "$LOGS_DIR"
 
-# 檢查是否需要解壓縮
-if [ ! -f "$KAFKA_HOME/bin/kafka-server-start.sh" ]; then
-  if [[ -z "$DIST_FILE" ]]; then
-    echo "錯誤: 尚未建立 Kafka 主程式，必須使用 --distribution 指定壓縮檔以進行初始化。"
-    exit 1
-  fi
-  echo "正在解壓縮 $DIST_FILE 至 $KAFKA_HOME ..."
+# 檢查是否需要解壓縮 (依照是否傳入 distribution 來決定)
+if [[ -n "$DIST_FILE" ]]; then
+  echo "偵測到指定了新的 Kafka 壓縮檔，正在清理舊有程式並重新解壓縮 $DIST_FILE 至 $KAFKA_HOME ..."
+  rm -rf "$KAFKA_HOME"
   mkdir -p "$KAFKA_HOME"
   tar -xzf "$DIST_FILE" -C "$KAFKA_HOME" --strip-components=1
 else
-  echo "發現已解壓縮的 Kafka 主程式，將直接重複使用: $KAFKA_HOME"
+  if [ ! -f "$KAFKA_HOME/bin/kafka-server-start.sh" ]; then
+    echo "錯誤: 尚未建立 Kafka 主程式，必須使用 --distribution 指定壓縮檔以進行初始化。"
+    exit 1
+  fi
+  echo "未指定新的壓縮檔，發現已解壓縮的 Kafka 主程式，將直接重複使用: $KAFKA_HOME"
 fi
 
 echo "本次執行的專屬工作目錄: $RUN_WORKSPACE"
 
-# 4. 取得 KRaft Cluster ID (使用本機 Java 執行)
+# 4. 取得 KRaft Cluster ID
 echo "正在產生 KRaft Cluster ID..."
 CLUSTER_ID=$("$KAFKA_HOME/bin/kafka-storage.sh" random-uuid)
 echo "Cluster ID: $CLUSTER_ID"
 
-# 5. 組合 Controller Quorum Voters 字串 (內部溝通皆綁定 localhost 的獨立 Port)
+# 5. 取得本機對外的 IP 位址
+HOST_ADDRESS=$(hostname -I 2>/dev/null | awk '{print $1}')
+if [[ -z "$HOST_ADDRESS" ]]; then
+  HOST_ADDRESS="127.0.0.1" # 如果抓不到，退回到 localhost 安全模式
+  echo "警告: 無法偵測外部 IP，將回退使用 127.0.0.1。"
+else
+  echo "偵測到本機對外位址為: $HOST_ADDRESS"
+fi
+
+# 6. 組合 Controller Quorum Voters 字串
 VOTERS=""
 for i in $(seq 1 $CONTROLLERS); do
   CTRL_PORT=$((19080 + i))
-  VOTERS="${VOTERS}${i}@localhost:${CTRL_PORT},"
+  VOTERS="${VOTERS}${i}@${HOST_ADDRESS}:${CTRL_PORT},"
 done
 VOTERS=${VOTERS%,}
 
-# 6. 處理自訂配置函式
+# 處理自訂配置函式
 append_custom_configs() {
   local configs="$1"
   local target_file="$2"
@@ -88,7 +98,7 @@ append_custom_configs() {
   fi
 }
 
-# 7. 啟動 Controllers (Ports: 19081, 19082...)
+# 7. 啟動 Controllers
 echo "==== 準備啟動 $CONTROLLERS 個 Controllers ===="
 for i in $(seq 1 $CONTROLLERS); do
   CONF_FILE="$CONFIGS_DIR/controller-$i.properties"
@@ -100,35 +110,22 @@ process.roles=controller
 node.id=$i
 controller.quorum.voters=$VOTERS
 controller.listener.names=CONTROLLER
-listeners=CONTROLLER://localhost:$CTRL_PORT
+listeners=CONTROLLER://0.0.0.0:$CTRL_PORT
 log.dirs=$NODE_DATA_DIR
 EOF
   append_custom_configs "$CONTROLLER_CONFIGS" "$CONF_FILE"
 
-  # 格式化儲存目錄
   "$KAFKA_HOME/bin/kafka-storage.sh" format -t "$CLUSTER_ID" -c "$CONF_FILE" > /dev/null
 
-  # 設定專屬的 JMX Port 並在背景啟動
   CTRL_JMX_PORT=$((9980 + i))
   JMX_PORT=$CTRL_JMX_PORT nohup "$KAFKA_HOME/bin/kafka-server-start.sh" "$CONF_FILE" > "$LOGS_DIR/controller-$i.log" 2>&1 &
   echo "已在背景啟動 controller-$i (Port: $CTRL_PORT, JMX: $CTRL_JMX_PORT, 日誌: $LOGS_DIR/controller-$i.log)"
 done
 
-# 等待 Controller 初始化
 sleep 3
 
-# 8. 啟動 Brokers (Ports: 19091, 19092...)
+# 8. 啟動 Brokers
 echo "==== 準備啟動 $BROKERS 個 Brokers ===="
-
-# 自動取得本機對外的 IP (適用於大多數 Linux)
-HOST_ADDRESS=$(hostname -I 2>/dev/null | awk '{print $1}')
-if [[ -z "$HOST_ADDRESS" ]]; then
-  HOST_ADDRESS="127.0.0.1" # 如果抓不到，退回到 localhost 安全模式
-  echo "警告: 無法偵測外部 IP，Broker 將回退使用 127.0.0.1 作為對外廣播位址。"
-else
-  echo "偵測到本機對外位址為: $HOST_ADDRESS，將設定為 advertised.listeners"
-fi
-
 for i in $(seq 1 $BROKERS); do
   node_id=$((CONTROLLERS + i))
   CONF_FILE="$CONFIGS_DIR/broker-$i.properties"
@@ -140,18 +137,14 @@ process.roles=broker
 node.id=$node_id
 controller.quorum.voters=$VOTERS
 controller.listener.names=CONTROLLER
-# 讓 Kafka 監聽所有網卡介面 (0.0.0.0)
 listeners=PLAINTEXT://0.0.0.0:$BROKER_PORT
-# 告訴外部 Client 用這台機器的實際 IP 來連線
 advertised.listeners=PLAINTEXT://$HOST_ADDRESS:$BROKER_PORT
 log.dirs=$NODE_DATA_DIR
 EOF
   append_custom_configs "$BROKER_CONFIGS" "$CONF_FILE"
 
-  # 格式化儲存目錄
   "$KAFKA_HOME/bin/kafka-storage.sh" format -t "$CLUSTER_ID" -c "$CONF_FILE" > /dev/null
 
-  # 設定專屬的 JMX Port 並在背景啟動
   BROKER_JMX_PORT=$((9990 + i))
   JMX_PORT=$BROKER_JMX_PORT nohup "$KAFKA_HOME/bin/kafka-server-start.sh" "$CONF_FILE" > "$LOGS_DIR/broker-$i.log" 2>&1 &
   echo "已在背景啟動 broker-$i (Node ID: $node_id, 對外 Port: $BROKER_PORT, JMX: $BROKER_JMX_PORT)"
@@ -159,12 +152,12 @@ done
 
 echo "==== 啟動完成！ ===="
 echo "本次執行的資料與配置皆已放置於: $RUN_WORKSPACE"
-echo "--- 外部 Client 連線資訊 ---"
+echo "--- 外部連線資訊 (Broker) ---"
 echo "Brokers 端點: $HOST_ADDRESS:19091, $HOST_ADDRESS:19092 ..."
 echo "Brokers JMX:  $HOST_ADDRESS:9991, $HOST_ADDRESS:9992 ..."
-echo "--- 內部與 Controller 資訊 ---"
-echo "Controllers 端點: localhost:19081, localhost:19082 ..."
-echo "Controllers JMX:  localhost:9981, localhost:9982 ..."
+echo "--- 外部連線資訊 (Controller) ---"
+echo "Controllers 端點: $HOST_ADDRESS:19081, $HOST_ADDRESS:19082 ..."
+echo "Controllers JMX:  $HOST_ADDRESS:9981, $HOST_ADDRESS:9982 ..."
 echo ""
 echo "若要查看服務啟動狀況，請檢查: $LOGS_DIR 底下的 log 檔案。"
 echo "再次啟動前，請確保使用 'pkill -f kafka.Kafka' 指令清除舊的行程，避免 Port 被佔用。"
