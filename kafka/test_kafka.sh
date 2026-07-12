@@ -62,9 +62,10 @@ done
 # 如果沒有提供路徑參數，就使用預設路徑
 PROJECT_DIR=$(realpath "${PROJECT_DIR_ARG:-$DEFAULT_DIR}")
 GRADLE_USER_HOME="${HOME}/.gradle"
-CONTAINER_WORKDIR="/workspace"
-# 獨立指定容器內的 Gradle Cache 路徑，避免存取到 /root 導致權限錯誤
-CONTAINER_GRADLE_HOME="/gradle-cache"
+
+# 將工作目錄移至容器內所有使用者皆可寫入的 /tmp 目錄
+CONTAINER_WORKDIR="/tmp/workspace"
+CONTAINER_GRADLE_HOME="/tmp/gradle-cache"
 
 if [ ! -d "$PROJECT_DIR" ]; then
   echo "錯誤: 找不到指定的專案目錄 '$PROJECT_DIR'"
@@ -74,25 +75,28 @@ fi
 mkdir -p "$GRADLE_USER_HOME"
 
 # ==========================================
-# 5. 啟動 Podman
+# 5. 啟動 Podman (實體複製隔離)
 # ==========================================
-echo "🚀 啟動獨立並行測試容器 (使用 Podman Overlay 模式)..."
-echo "📂 專案掛載: $PROJECT_DIR -> $CONTAINER_WORKDIR (Copy-on-Write)"
-echo "📦 快取掛載: $GRADLE_USER_HOME -> $CONTAINER_GRADLE_HOME (Copy-on-Write)"
+echo "🚀 啟動獨立並行測試容器 (實體複製隔離模式)..."
+echo "📂 唯讀掛載: $PROJECT_DIR -> /source_ro"
+echo "📦 專案工作區: $CONTAINER_WORKDIR (容器內獨立空間)"
 echo "⚙️  資源限制: CPU: $TARGET_CPU 核心, 記憶體: $TARGET_MEM"
 echo "---------------------------------------------------"
 
-# 關鍵參數說明：
-# :O -> 代表 Overlay 掛載，本機目錄唯讀，容器內的修改會寫入獨立的暫存層
-# -e GRADLE_USER_HOME -> 告訴 Gradle 使用我們指定的路徑作為快取目錄
-# --cpus / --memory -> 限制容器資源
 podman run --rm -it \
   --userns=keep-id \
   --cpus="$TARGET_CPU" \
   --memory="$TARGET_MEM" \
   -e GRADLE_USER_HOME="$CONTAINER_GRADLE_HOME" \
-  -v "$PROJECT_DIR":"$CONTAINER_WORKDIR":O \
-  -v "$GRADLE_USER_HOME":"$CONTAINER_GRADLE_HOME":O \
-  -w "$CONTAINER_WORKDIR" \
+  -v "$PROJECT_DIR":"/source_ro:ro,z" \
+  -v "$GRADLE_USER_HOME":"$CONTAINER_GRADLE_HOME:O" \
   docker.io/library/eclipse-temurin:21-jdk \
-  bash
+  bash -c "
+    echo '🔄 正在建立獨立測試環境 (複製檔案中)...'
+    mkdir -p $CONTAINER_WORKDIR
+    # 加上 --no-preserve=ownership 避免容器內非 root 權限無法更改檔案擁有者
+    cp -a --no-preserve=ownership /source_ro/. $CONTAINER_WORKDIR/
+    cd $CONTAINER_WORKDIR
+    echo '✅ 環境準備完成！現在可以執行測試 (建議使用 ./gradlew test --no-daemon)'
+    exec bash
+  "
