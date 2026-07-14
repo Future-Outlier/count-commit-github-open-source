@@ -75,7 +75,23 @@ fi
 mkdir -p "$GRADLE_USER_HOME"
 
 # ==========================================
-# 5. 啟動 Podman (實體複製隔離)
+# 5. 確保映像檔包含 Git (動態建置)
+# ==========================================
+BASE_IMAGE="docker.io/library/eclipse-temurin:21-jdk"
+CUSTOM_IMAGE="eclipse-temurin-21-jdk-with-git"
+
+# 檢查自訂映像檔是否已存在，若不存在則透過標準輸入 (stdin) 動態建置
+if ! podman image inspect "$CUSTOM_IMAGE" &> /dev/null; then
+    echo "📦 首次執行或找不到自訂映像檔：正在建立包含 Git 的環境映像檔..."
+    podman build -t "$CUSTOM_IMAGE" - <<EOF
+FROM $BASE_IMAGE
+RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
+EOF
+    echo "✅ 自訂映像檔建置完成！"
+fi
+
+# ==========================================
+# 6. 啟動 Podman (實體複製隔離)
 # ==========================================
 echo "🚀 啟動獨立並行測試容器 (實體複製隔離模式)..."
 echo "📂 唯讀掛載: $PROJECT_DIR -> /source_ro"
@@ -90,13 +106,15 @@ podman run --rm -it \
   -e GRADLE_USER_HOME="$CONTAINER_GRADLE_HOME" \
   -v "$PROJECT_DIR":"/source_ro:ro,z" \
   -v "$GRADLE_USER_HOME":"$CONTAINER_GRADLE_HOME:O" \
-  docker.io/library/eclipse-temurin:21-jdk \
+  "$CUSTOM_IMAGE" \
   bash -c "
     echo '🔄 正在建立獨立測試環境 (複製檔案中)...'
     mkdir -p $CONTAINER_WORKDIR
     # 加上 --no-preserve=ownership 避免容器內非 root 權限無法更改檔案擁有者
     cp -a --no-preserve=ownership /source_ro/. $CONTAINER_WORKDIR/
     cd $CONTAINER_WORKDIR
+
     echo '✅ 環境準備完成！現在可以執行測試 (建議使用 ./gradlew test --no-daemon)'
+    echo '💡 Git 已安裝，可使用 git status 等指令進行版控操作。'
     exec bash
   "
