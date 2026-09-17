@@ -1,0 +1,34 @@
+pipeline {
+    agent any
+
+    parameters {
+        password(name: 'GITHUB_TOKEN', defaultValue: '',
+                description: '你自己的 GitHub token（classic，勾 repo 或不勾 scope）。只用於這次 build，不會存下來')
+        string(name: 'CONFIG', defaultValue: 'people.json',
+                description: 'people.json 的路徑（相對於 workspace）')
+    }
+
+    options {
+        disableConcurrentBuilds()
+    }
+
+    stages {
+        stage('Run') {
+            steps {
+                // 快取依 token 分開：帶 repo scope 的 token 會把私有 repo 的回應存進快取，不能跟別人共用
+                withEnv(["GITHUB_TOKEN=${params.GITHUB_TOKEN}"]) {
+                    sh '''
+                        set -e
+                        if [ -z "${GITHUB_TOKEN}" ]; then
+                            echo "請提供 GITHUB_TOKEN" >&2
+                            exit 1
+                        fi
+                        export GH_ACTIVITY_CACHE="${JENKINS_HOME}/gh_activity_cache/$(printf %s "${GITHUB_TOKEN}" | sha256sum | cut -c1-16)"
+                        set +x
+                        python3 gh_activity.py --config "${CONFIG}"
+                    '''
+                }
+            }
+        }
+    }
+}

@@ -2,12 +2,12 @@
 """
 下載指定 GitHub 帳號在指定 repo 的活動紀錄，並替他開的 PR 算一個「重要性」分數。
 
-只在終端機印出統計摘要。API 回應會連同 ETag 存在 .cache/，重跑時沒變的回 304，不扣額度（記得把 .cache/ 加進 .gitignore）。
+只在終端機印出統計摘要。API 回應會連同 ETag 存在 ~/.cache/gh_activity/，重跑時沒變的回 304，不扣額度。
 
 用法：
   export GITHUB_TOKEN=ghp_xxx
   python gh_activity.py --repo apache/kafka --user chia7712              # 單人單 repo，預設看過去 60 天
-  python gh_activity.py --config people.json [--brief]                   # 多人多 repo
+  python gh_activity.py --config people.json [--detail]                  # 多人多 repo，預設只印總表
   python gh_activity.py --config people.json --since 2026-01-01 --until 2026-09-17
 
 people.json 格式：
@@ -26,7 +26,7 @@ JIRA 匿名可讀，被限速時可設 JIRA_TOKEN（JIRA Profile → Personal Ac
 
 多 repo 的合併規則：數量分各 repo 相加；品質分把該人所有 repo 的 PR 放在一起取前 N。
 """
-import argparse, hashlib, http.client, json, math, os, re, sys, threading, time, urllib.parse, urllib.request, urllib.error
+import argparse, hashlib, http.client, json, math, os, re, sys, threading, time, unicodedata, urllib.parse, urllib.request, urllib.error
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
@@ -125,7 +125,9 @@ def is_backport(title):
     return bool(BACKPORT_TITLE.search(title))
 
 
-CACHE_DIR = ".cache"   # ETag 快取目錄，--no-cache 可關閉。304 回應不扣 API 額度，重跑幾乎免費
+# ETag 快取目錄：預設 ~/.cache/gh_activity，可用環境變數 GH_ACTIVITY_CACHE 或 --cache-dir 改；--no-cache 關閉。
+# 304 回應不扣 API 額度，重跑幾乎免費
+CACHE_DIR = os.environ.get("GH_ACTIVITY_CACHE") or os.path.join(os.path.expanduser("~"), ".cache", "gh_activity")
 _cache_enabled = True
 
 
@@ -433,6 +435,60 @@ def fetch_person_issues(p, since, until, repo_jira):
         except RuntimeError as e:
             print(f"  JIRA 查詢失敗，略過：{e}", file=sys.stderr)
     return sorted(rows, key=lambda x: -x["score"])
+
+
+def _width(text):
+    """終端機顯示寬度：全形字算 2。"""
+    return sum(2 if unicodedata.east_asian_width(ch) in "WF" else 1 for ch in text)
+
+
+def _pad(text, width, right=False):
+    gap = width - _width(text)
+    return (" " * gap + text) if right else (text + " " * gap)
+
+
+def render_table(rows):
+    """rows 是每列的 cell 清單，第一列是表頭。數字欄靠右。"""
+    ncol = max(len(r) for r in rows)
+    rows = [r + [""] * (ncol - len(r)) for r in rows]
+    widths = [max(_width(r[i]) for r in rows) for i in range(ncol)]
+    numeric = [all(re.fullmatch(r"[+-]?\d[\d.,]*", r[i]) for r in rows[1:] if r[i]) for i in range(ncol)]
+    out = ["  ".join(_pad(c, widths[i], numeric[i]) for i, c in enumerate(rows[0])).rstrip(),
+           "  ".join("-" * w for w in widths)]
+    for r in rows[1:]:
+        out.append("  ".join(_pad(c, widths[i], numeric[i]) for i, c in enumerate(r)).rstrip())
+    return out
+
+
+def render(lines, fmt="text"):
+    """把摘要的 markdown 子集轉成純文字（表格對齊、標題加底線），fmt=markdown 則原樣輸出。"""
+    lines = [l for line in lines for l in line.split("\n")]
+    if fmt == "markdown":
+        return "\n".join(lines)
+    out, table = [], []
+    def flush():
+        if table:
+            out.extend(render_table(table)); table.clear()
+    for line in lines:
+        st = line.strip()
+        if st.startswith("|"):
+            cells = [c.strip() for c in st.strip("|").split("|")]
+            if not all(set(c) <= set("-: ") for c in cells):
+                table.append(cells)
+            continue
+        flush()
+        if st.startswith("### "):
+            out.append(f"[{st[4:]}]")
+        elif st.startswith("## "):
+            out.append(st[3:]); out.append("=" * _width(st[3:]))
+        elif st.startswith("# "):
+            out.append(st[2:].upper() if st[2:].isascii() else st[2:]); out.append("#" * max(_width(st[2:]), 20))
+        elif st == "---":
+            out.append("")
+        else:
+            out.append(line)
+    flush()
+    return "\n".join(out)
 
 
 def normalize_repo(repo):
@@ -743,6 +799,7 @@ def best_review(m):
 
 
 def main():
+    global _cache_enabled, CACHE_DIR
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", help="JSON 設定檔，多個人 × 多個 repo")
     ap.add_argument("--repo", help="單人模式：owner/repo 或 https://github.com/owner/repo")
@@ -750,11 +807,15 @@ def main():
     ap.add_argument("--jira", help="單人模式：JIRA 帳號（repo 用 JIRA 時才需要）")
     ap.add_argument("--since", help="YYYY-MM-DD，預設為 60 天前（--config 內的設定優先）")
     ap.add_argument("--until", help="YYYY-MM-DD，預設為今天")
-    ap.add_argument("--brief", action="store_true", help="只印總表，不印每個人的明細")
-    ap.add_argument("--no-cache", action="store_true", help="不使用 .cache/ 的 ETag 快取")
+    ap.add_argument("--detail", action="store_true", help="總表之後再印每個人的明細（預設只印總表）")
+    ap.add_argument("--format", choices=["text", "markdown"], default="text",
+                    help="輸出格式：text（預設，terminal / Jenkins console 好讀）或 markdown")
+    ap.add_argument("--no-cache", action="store_true", help="不使用 ETag 快取")
+    ap.add_argument("--cache-dir", help="快取目錄，預設 ~/.cache/gh_activity")
     a = ap.parse_args()
-    global _cache_enabled
     _cache_enabled = not a.no_cache
+    if a.cache_dir:
+        CACHE_DIR = a.cache_dir
 
     if not TOKEN:
         sys.exit("未設定 GITHUB_TOKEN，每小時只有 60 次額度，跑不完。請 export GITHUB_TOKEN=... 後再執行。")
@@ -811,8 +872,9 @@ def main():
     # 單人單 repo：維持原本的輸出格式
     if len(rows) == 1 and len(rows[0][2]) == 1:
         p, m, results, scored, reviewed, stats = rows[0]
-        print("\n".join(summary_lines(scored, reviewed, stats, m,
-                                      f"# {p['user']} @ {results[0]['repo']}\n區間：{since} ~ {until}", issues=p["issues"])))
+        lines = summary_lines(scored, reviewed, stats, m,
+                              f"# {p['user']} @ {results[0]['repo']}\n區間：{since} ~ {until}", issues=p["issues"])
+        print(render(lines, a.format))
         return
 
     # 多人：總表 + 每人明細
@@ -832,7 +894,7 @@ def main():
                    f"| {m['main_repo']}（{m['main_repo_total']:+.1f}） |")
     out += ["", "品質分排序：" + " > ".join(
         f"{p['user']}（{fmt(m['q_total'])}）" for p, m, *_ in sorted(rows, key=lambda x: -(x[1]["q_total"] or -1e9)))]
-    if not a.brief:
+    if a.detail:
         for p, m, results, scored, reviewed, stats in rows:
             out += ["", "---", "", f"## {p['user']}", ""]
             if len(results) > 1:
@@ -843,7 +905,7 @@ def main():
                     out += [""] + summary_lines(res["scored"], res["reviewed"], res, rm, f"### {res['repo']}")
             else:
                 out += summary_lines(scored, reviewed, stats, m, f"### {results[0]['repo']}", issues=p["issues"])
-    print("\n".join(out))
+    print(render(out, a.format))
 
 
 if __name__ == "__main__":
