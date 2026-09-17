@@ -2,3 +2,4 @@
 
 scheduler.yaml
 yunikorn-rbac.yaml
+.cache/
