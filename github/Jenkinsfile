@@ -15,7 +15,8 @@ pipeline {
     stages {
         stage('Run') {
             steps {
-                // 快取依 token 分開：帶 repo scope 的 token 會把私有 repo 的回應存進快取，不能跟別人共用
+                // 快取放在 agent 使用者的 HOME 下，跨 build 共用；依 token 分開，
+                // 因為帶 repo scope 的 token 會把私有 repo 的回應存進快取，不能跟別人共用
                 dir('github') {
                     withEnv(["GITHUB_TOKEN=${params.GITHUB_TOKEN}"]) {
                         sh '''
@@ -24,7 +25,7 @@ pipeline {
                             echo "請提供 GITHUB_TOKEN" >&2
                             exit 1
                         fi
-                        export GH_ACTIVITY_CACHE="${JENKINS_HOME}/gh_activity_cache/$(printf %s "${GITHUB_TOKEN}" | sha256sum | cut -c1-16)"
+                        export GH_ACTIVITY_CACHE="${HOME}/.cache/gh_activity/$(printf %s "${GITHUB_TOKEN}" | sha256sum | cut -c1-16)"
                         set +x
                         python3 gh_activity.py --config "${CONFIG}"
                     '''
