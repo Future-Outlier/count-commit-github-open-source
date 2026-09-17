@@ -8,6 +8,7 @@
   export GITHUB_TOKEN=ghp_xxx
   python gh_activity.py --repo apache/kafka --user chia7712              # 單人單 repo，預設看過去 60 天
   python gh_activity.py --config people.json [--detail]                  # 多人多 repo，預設只印總表
+  python gh_activity.py --config https://gist.githubusercontent.com/.../raw/people.json
   python gh_activity.py --config people.json --since 2026-01-01 --until 2026-09-17
 
 people.json 格式：
@@ -491,6 +492,26 @@ def render(lines, fmt="text"):
     return "\n".join(out)
 
 
+def load_config(path_or_url):
+    """--config 可以是本機路徑或 http(s) 網址（例如 gist 的 raw 連結）。"""
+    if re.match(r"^https?://", path_or_url):
+        print(f"下載設定檔：{path_or_url}", file=sys.stderr)
+        req = urllib.request.Request(path_or_url, headers={"User-Agent": "gh-activity"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return json.load(r)
+        except urllib.error.HTTPError as e:
+            sys.exit(f"無法下載設定檔（HTTP {e.code}）：{path_or_url}")
+        except ValueError:
+            sys.exit(f"設定檔不是合法的 JSON：{path_or_url}（gist 要用 raw 連結）")
+    try:
+        return json.load(open(path_or_url))
+    except FileNotFoundError:
+        sys.exit(f"找不到設定檔：{path_or_url}")
+    except ValueError:
+        sys.exit(f"設定檔不是合法的 JSON：{path_or_url}")
+
+
 def normalize_repo(repo):
     """接受 owner/repo 或完整網址。"""
     repo = re.sub(r"^(https?://)?(www\.)?github\.com/", "", repo.strip()).rstrip("/")
@@ -801,7 +822,7 @@ def best_review(m):
 def main():
     global _cache_enabled, CACHE_DIR
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--config", help="JSON 設定檔，多個人 × 多個 repo")
+    ap.add_argument("--config", help="JSON 設定檔的路徑或 http(s) 網址，多個人 × 多個 repo")
     ap.add_argument("--repo", help="單人模式：owner/repo 或 https://github.com/owner/repo")
     ap.add_argument("--user", help="單人模式：GitHub 帳號")
     ap.add_argument("--jira", help="單人模式：JIRA 帳號（repo 用 JIRA 時才需要）")
@@ -821,7 +842,7 @@ def main():
         sys.exit("未設定 GITHUB_TOKEN，每小時只有 60 次額度，跑不完。請 export GITHUB_TOKEN=... 後再執行。")
 
     if a.config:
-        cfg = json.load(open(a.config))
+        cfg = load_config(a.config)
         people = [{"user": p["user"], "jira": p.get("jira"), "repos": [normalize_repo(r) for r in p["repos"]]}
                   for p in cfg["people"]]
         since, until = cfg.get("since") or a.since, cfg.get("until") or a.until

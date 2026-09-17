@@ -5,7 +5,7 @@ pipeline {
         password(name: 'GITHUB_TOKEN', defaultValue: '',
                 description: '你自己的 GitHub token（classic，勾 repo 或不勾 scope）。只用於這次 build，不會存下來')
         string(name: 'CONFIG', defaultValue: 'people.json',
-                description: 'people.json 的路徑（相對於 github/ 目錄）')
+                description: 'people.json 的路徑（相對於 github/ 目錄）或 http(s) 網址，例如 gist 的 raw 連結')
     }
 
     options {
