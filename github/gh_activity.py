@@ -11,16 +11,19 @@
   python gh_activity.py --config https://gist.githubusercontent.com/.../raw/people.json
   python gh_activity.py --config people.json --since 2026-01-01 --until 2026-09-17
 
-people.json 格式：
+people.json 格式（每個人都查全部 repo）：
   {
     "since": "2026-08-03",            # 可省略
     "until": "2026-09-17",            # 可省略
-    "people": [
-      {"user": "jason810496", "repos": ["apache/airflow"]},
-      {"user": "chia7712", "jira": "chia7712", "repos": ["apache/kafka", "apache/yunikorn-core"]}
-    ],
+    "users": ["jason810496", "chia7712"],
+    "repos": ["apache/airflow", "apache/kafka"],
+    "jira": {"chia7712": "chia7712"},                  # 可省略，GitHub 帳號 → JIRA 帳號
     "jira_projects": {"apache/some-repo": "SOMEKEY"}   # 可省略，覆蓋或新增 repo → JIRA 專案的對應
   }
+  舊格式（每個人各自列 repo）也接受：{"people": [{"user": "...", "repos": [...], "jira": "..."}]}
+
+搜尋是一個 repo 一次搜一批人（重複的 author: 是「或」），每個 PR 的留言只抓一次再拆給有參與的人，
+所以人數多的時候比一個人一個 repo 分開跑省很多搜尋額度。
 
 開題目：repo 有對應的 JIRA 專案（REPO_JIRA）就查 ASF JIRA（需要 jira 帳號），否則查 GitHub Issues。
 JIRA 匿名可讀，被限速時可設 JIRA_TOKEN（JIRA Profile → Personal Access Tokens）。
@@ -399,43 +402,56 @@ def fetch_jira_issues(jira_user, project, since, until):
     return rows
 
 
-def fetch_github_issues(user, repo, since, until):
-    """這個人在 GitHub repo 裡、區間內開的 issue（不含 PR）。"""
-    print(f"GitHub Issues {repo}：查 {user} 開的 issue ...", file=sys.stderr)
-    q = f"is:issue repo:{repo} author:{user} created:{since}..{until}"
-    rows = []
-    for it in get_all(f"{API}/search/issues", {"q": q}, key="items"):
-        reason = it.get("state_reason") or ""
-        solved = it["state"] == "closed" and reason == "completed"
-        closed_bad = it["state"] == "closed" and not solved
-        assignees = {(a or {}).get("login", "").lower() for a in (it.get("assignees") or [])}
-        rows.append(issue_score({
-            "source": "github", "key": f"{repo}#{it['number']}", "title": it["title"], "url": it["html_url"],
-            "created": it["created_at"], "resolution": reason or ("open" if it["state"] == "open" else "closed"),
-            "solved": solved, "closed_bad": closed_bad,
-            "by_other": solved and (not assignees or user.lower() not in assignees),
-            "comments": it.get("comments", 0),
-        }))
+def fetch_github_issues(repo, users, since, until):
+    """一群人在 GitHub repo 裡、區間內開的 issue（不含 PR），分批搜，回傳 {user: rows}。"""
+    print(f"GitHub Issues {repo}：查 {len(users)} 人開的 issue ...", file=sys.stderr)
+    base = f"is:issue repo:{repo} created:{since}..{until}"
+    rows = {u: [] for u in users}
+    for batch in user_batches(users, base, "author"):
+        for it in search_users(base, "author", batch):
+            user = it["user"]["login"]
+            if user not in rows:
+                continue
+            reason = it.get("state_reason") or ""
+            solved = it["state"] == "closed" and reason == "completed"
+            closed_bad = it["state"] == "closed" and not solved
+            assignees = {(a or {}).get("login", "").lower() for a in (it.get("assignees") or [])}
+            rows[user].append(issue_score({
+                "source": "github", "key": f"{repo}#{it['number']}", "title": it["title"], "url": it["html_url"],
+                "created": it["created_at"], "resolution": reason or ("open" if it["state"] == "open" else "closed"),
+                "solved": solved, "closed_bad": closed_bad,
+                "by_other": solved and (not assignees or user.lower() not in assignees),
+                "comments": it.get("comments", 0),
+            }))
     return rows
 
 
-def fetch_person_issues(p, since, until, repo_jira):
-    """一個人開的題目：repo 有對應 JIRA 專案就查 JIRA（同一專案只查一次），否則查 GitHub Issues。"""
-    rows, projects = [], []
-    for repo in p["repos"]:
+def fetch_all_issues(repo_users, jira_users, since, until, repo_jira):
+    """所有人開的題目。GitHub Issues 依 repo 分批查；JIRA 依 (帳號, 專案) 各查一次。回傳 {user: rows}。"""
+    out = {}
+    jira_done = set()
+    for repo, users in repo_users.items():
         key = repo_jira.get(repo)
         if key is None:
-            rows += fetch_github_issues(p["user"], repo, since, until)
-        elif not p.get("jira"):
-            print(f"  {repo} 用 JIRA（{key}），但 {p['user']} 沒有設定 jira 帳號，開題目略過", file=sys.stderr)
-        elif key not in projects:
-            projects.append(key)
-    for key in projects:
-        try:
-            rows += fetch_jira_issues(p["jira"], key, since, until)
-        except RuntimeError as e:
-            print(f"  JIRA 查詢失敗，略過：{e}", file=sys.stderr)
-    return sorted(rows, key=lambda x: -x["score"])
+            for u, rows in fetch_github_issues(repo, users, since, until).items():
+                out.setdefault(u, []).extend(rows)
+            continue
+        for u in users:
+            jira_user = jira_users.get(u)
+            if not jira_user:
+                continue
+            if (u, key) in jira_done:
+                continue
+            jira_done.add((u, key))
+            try:
+                out.setdefault(u, []).extend(fetch_jira_issues(jira_user, key, since, until))
+            except RuntimeError as e:
+                print(f"  JIRA 查詢失敗，略過：{e}", file=sys.stderr)
+    missing = sorted({u for repo, users in repo_users.items() if repo_jira.get(repo)
+                      for u in users if not jira_users.get(u)})
+    if missing:
+        print(f"  以下帳號沒有設定 jira，JIRA 專案的開題目略過：{', '.join(missing)}", file=sys.stderr)
+    return {u: sorted(rows, key=lambda x: -x["score"]) for u, rows in out.items()}
 
 
 def _width(text):
@@ -551,144 +567,213 @@ def ensure_quota(repo, min_needed=300):
         time.sleep(max(wait, 5))
 
 
-def analyze(user, repo, since, until):
-    """抓一個人在一個 repo 的活動，回傳統計結果（不印任何東西）。"""
-    print(f"\n== {user} @ {repo} ==", file=sys.stderr)
+SEARCH_QUERY_MAX = 256   # GitHub 搜尋字串上限
+
+
+def user_batches(users, base_query, rel):
+    """把帳號分批，讓 base_query + 'rel:user ...' 不超過 256 字元。"""
+    batches, cur, length = [], [], len(base_query)
+    for u in users:
+        term = len(f" {rel}:{u}")
+        if cur and length + term > SEARCH_QUERY_MAX:
+            batches.append(cur); cur, length = [], len(base_query)
+        cur.append(u); length += term
+    if cur:
+        batches.append(cur)
+    return batches
+
+
+def search_users(base_query, rel, users):
+    """一次搜一批帳號（重複的 rel: 是「或」的關係）。撞到 1000 筆上限就把這批對半拆開重搜。"""
+    q = base_query + "".join(f" {rel}:{u}" for u in users)
+    found = get_all(f"{API}/search/issues", {"q": q}, key="items")
+    if len(found) >= 1000:
+        if len(users) == 1:
+            print(f"  警告：{rel}:{users[0]} 搜尋結果達 1000 筆上限，請縮小日期區間", file=sys.stderr)
+            return found
+        mid = len(users) // 2
+        return search_users(base_query, rel, users[:mid]) + search_users(base_query, rel, users[mid:])
+    return found
+
+
+def verify_or_semantics(repo, since, users):
+    """確認重複的 author: 是「或」：兩個帳號合搜的筆數不能少於單一帳號的筆數。只在第一個 repo 檢查一次。"""
+    if len(users) < 2:
+        return
+    base = f"is:pr repo:{repo} updated:>={since}"
+    def count(q):
+        data, _ = get(f"{API}/search/issues", {"q": q, "per_page": 1})
+        return data.get("total_count", 0)
+    single = count(f"{base} author:{users[0]}")
+    both = count(f"{base} author:{users[0]} author:{users[1]}")
+    if both < single:
+        sys.exit("GitHub 搜尋對重複的 author: 不是「或」的語意，無法批次搜尋。請回報這個問題。")
+
+
+def analyze_repo(repo, users, since, until):
+    """抓一群人在一個 repo 的活動，回傳 {user: 統計結果}。
+    搜尋是分批合併查的，每個 PR 的留言只抓一次，再拆給有參與的人。"""
+    users = list(users)
+    user_set = set(users)
+    print(f"\n== {repo}（{len(users)} 人）==", file=sys.stderr)
     ensure_quota(repo)
 
-    # 1. commits
+    # 1. commits：整個 repo 區間內的 commit 列一次，再依作者分
     print("下載 commits ...", file=sys.stderr)
-    p = {"author": user, "since": f"{since}T00:00:00Z", "until": f"{until}T23:59:59Z"}
-    commits = get_all(f"{API}/repos/{repo}/commits", p)
+    commits_by_user = Counter()
+    for c in get_all(f"{API}/repos/{repo}/commits", {"since": f"{since}T00:00:00Z", "until": f"{until}T23:59:59Z"}):
+        login = (c.get("author") or {}).get("login")
+        if login in user_set:
+            commits_by_user[login] += 1
 
-    # 2. 參與的 PR：分三種關係搜尋再合併（他開的、他留言的、他 review 過的），
+    # 2. 參與的 PR：三種關係（開的、留言的、review 過的）各分批搜，合併去重。
     #    不用 involves:，那會把只是被 @ 提到或被指派的 PR 也撈進來。
     print("搜尋參與的 PR ...", file=sys.stderr)
+    base = f"is:pr repo:{repo} updated:>={since}"
     seen, items = set(), []
+    n_queries = 0
     for rel in ("author", "commenter", "reviewed-by"):
-        q = f"is:pr repo:{repo} {rel}:{user} updated:>={since}"
-        found = get_all(f"{API}/search/issues", {"q": q}, key="items")
-        if len(found) >= 1000:
-            print(f"  警告：{rel} 搜尋結果達 1000 筆上限，請縮小日期區間分批跑", file=sys.stderr)
-        for i in found:
-            if i["number"] not in seen:
-                seen.add(i["number"]); items.append(i)
+        for batch in user_batches(users, base, rel):
+            n_queries += 1
+            for i in search_users(base, rel, batch):
+                if i["number"] not in seen:
+                    seen.add(i["number"]); items.append(i)
     prs = [{"number": i["number"], "title": i["title"], "author": i["user"]["login"],
             "state": i["state"], "created_at": i["created_at"], "url": i["html_url"],
             "merged_at": (i.get("pull_request") or {}).get("merged_at"),
             "n_issue_comments": i.get("comments", 0), "author_association": i.get("author_association"),
             "labels": [l["name"] for l in i.get("labels", [])]} for i in items]
+    print(f"  {n_queries} 次搜尋，{len(prs)} 個 PR", file=sys.stderr)
 
-    # 3. 平行抓每個 PR 的留言；作者是本人的 PR 另外算訊號
+    login = lambda r: (r.get("user") or {}).get("login")
+
+    def is_sub(c, kind):
+        return kind == "review_comment" or c.get("state") == "CHANGES_REQUESTED" \
+            or (kind == "review" and len((c.get("body") or "").strip()) >= SHORT_LEN)
+
+    # 3. 每個 PR 抓一次留言，拆給每個有參與的人。回傳 {user: (mine, own_row, review_row, backport_kind)}
     def process_pr(pr):
-        num = pr["number"]
-        own = pr["author"] == user
-        # 搜尋結果已知一般留言數，0 就不用抓
+        num, author = pr["number"], pr["author"]
         issue_c = get_all(f"{API}/repos/{repo}/issues/{num}/comments") if pr["n_issue_comments"] else []
         reviews = get_all(f"{API}/repos/{repo}/pulls/{num}/reviews")
-        # 行內留言一定隸屬於某個 review：別人的 PR 看本人有沒有 review，自己的 PR 看別人有沒有 review
-        login = lambda r: (r.get("user") or {}).get("login")
-        need_inline = any(login(r) not in (user, None) for r in reviews) if own else any(login(r) == user for r in reviews)
+        # 行內留言一定隸屬於某個 review：有受評者 review 了別人的 PR，或受評者的 PR 被別人 review，才需要抓
+        need_inline = any(login(r) in user_set and login(r) != author for r in reviews) or \
+            (author in user_set and any(login(r) != author and not is_bot(login(r)) for r in reviews))
         review_c = get_all(f"{API}/repos/{repo}/pulls/{num}/comments") if need_inline else []
-        mine = []
+
+        # 誰在這個 PR 上有留言
+        by_user = {}
         for kind, rows, tkey in (("issue_comment", issue_c, "created_at"),
                                  ("review_comment", review_c, "created_at"),
                                  ("review", reviews, "submitted_at")):
             for c in rows:
-                if (c.get("user") or {}).get("login") != user or not in_range(c.get(tkey), since, until):
+                u = login(c)
+                if u not in user_set or not in_range(c.get(tkey), since, until):
                     continue
-                mine.append({"pr": num, "pr_title": pr["title"], "type": kind,
-                             "review_state": c.get("state") if kind == "review" else None,
-                             "date": c.get(tkey), "body": c.get("body") or "", "url": c.get("html_url")})
+                by_user.setdefault(u, []).append({
+                    "pr": num, "pr_title": pr["title"], "type": kind,
+                    "review_state": c.get("state") if kind == "review" else None,
+                    "date": c.get(tkey), "body": c.get("body") or "", "url": c.get("html_url")})
 
-        if is_backport(pr["title"]):
-            kind = "review" if pr["author"] != user else "own"
-            return mine, None, None, (kind if (mine or kind == "own") else None)
-        if pr["author"] != user:
-            if not mine:
-                return mine, None, None, None
-            # 有實質意見（行內留言、request changes、有內容的結論）才去看之後有沒有新 commit
+        out = {}
+        backport = is_backport(pr["title"])
+        pr_commits = None   # 需要時才抓，一個 PR 最多一次
+
+        # 3a. review 別人的 PR
+        for u, mine in by_user.items():
+            if u == author:
+                continue
+            if backport:
+                out[u] = (mine, None, None, "review"); continue
             substantive = [c for c in mine if c["type"] == "review_comment"
                            or c["review_state"] == "CHANGES_REQUESTED"
                            or (c["type"] == "review" and len(c["body"].strip()) >= SHORT_LEN)]
             acted = first_rv = False
             if substantive:
                 first = min(c["date"] for c in substantive)
-                commits_ = get_all(f"{API}/repos/{repo}/pulls/{num}/commits")
-                acted = any((c["commit"]["committer"]["date"] or "") > first for c in commits_)
-                # 是不是整個 PR 上第一個留下實質意見的人（排除作者和 bot）
-                def is_sub(c, kind):
-                    return kind == "review_comment" or c.get("state") == "CHANGES_REQUESTED" \
-                        or (kind == "review" and len((c.get("body") or "").strip()) >= SHORT_LEN)
+                if pr_commits is None:
+                    pr_commits = get_all(f"{API}/repos/{repo}/pulls/{num}/commits")
+                acted = any((c["commit"]["committer"]["date"] or "") > first for c in pr_commits)
                 others_first = [c.get("created_at") or c.get("submitted_at")
                                 for kind, rows in (("review_comment", review_c), ("review", reviews))
                                 for c in rows
-                                if login(c) not in (user, pr["author"]) and not is_bot(login(c))
-                                and is_sub(c, kind)]
+                                if login(c) not in (u, author) and not is_bot(login(c)) and is_sub(c, kind)]
                 first_rv = not others_first or first < min(others_first)
-            return mine, None, review_score(pr, mine, acted, first_rv), None
-        if not in_range(pr["created_at"], since, until):
-            return mine, None, None, None
-        detail, _ = get(f"{API}/repos/{repo}/pulls/{num}")
-        files = get_all(f"{API}/repos/{repo}/pulls/{num}/files")
-        kinds = Counter(classify(f["filename"]) for f in files)
-        others = lambda rows: [r for r in rows if (r.get("user") or {}).get("login") != user
-                               and not is_bot((r.get("user") or {}).get("login"))]
-        reviewers = Counter(r["user"]["login"] for r in others(reviews))
-        merged_at = detail.get("merged_at")
-        row = {
-            "number": num, "title": pr["title"], "url": pr["url"], "labels": pr["labels"],
-            "created_at": pr["created_at"], "merged_at": merged_at,
-            "merged_by": (detail.get("merged_by") or {}).get("login"),
-            "hours_to_merge": round(hours_between(pr["created_at"], merged_at), 1) if merged_at else None,
-            "additions": detail.get("additions"), "deletions": detail.get("deletions"),
-            "changed_files": detail.get("changed_files"),
-            "files_prod": kinds["prod"], "files_test": kinds["test"],
-            "files_docs": kinds["docs"], "files_ci": kinds["ci"], "files_config": kinds["config"],
-            "issue_comments": len(others(issue_c)), "review_comments": len(others(review_c)),
-            "reviews": len(others(reviews)), "reviewers": sorted(reviewers),
-            "max_review_rounds": max(reviewers.values(), default=0),
-        }
-        score(row)
-        return mine, row, None, None
+            out[u] = (mine, None, review_score(pr, mine, acted, first_rv), None)
 
-    comments, scored, reviewed, backports = [], [], [], Counter()
+        # 3b. 受評者自己開的 PR
+        if author in user_set:
+            mine = by_user.get(author, [])
+            if backport:
+                out[author] = (mine, None, None, "own")
+            elif not in_range(pr["created_at"], since, until):
+                out[author] = (mine, None, None, None)
+            else:
+                detail, _ = get(f"{API}/repos/{repo}/pulls/{num}")
+                files = get_all(f"{API}/repos/{repo}/pulls/{num}/files")
+                kinds = Counter(classify(f["filename"]) for f in files)
+                others = lambda rows: [r for r in rows if login(r) != author and not is_bot(login(r))]
+                reviewers = Counter(r["user"]["login"] for r in others(reviews))
+                merged_at = detail.get("merged_at")
+                row = {
+                    "number": num, "title": pr["title"], "url": pr["url"], "labels": pr["labels"],
+                    "created_at": pr["created_at"], "merged_at": merged_at,
+                    "merged_by": (detail.get("merged_by") or {}).get("login"),
+                    "hours_to_merge": round(hours_between(pr["created_at"], merged_at), 1) if merged_at else None,
+                    "additions": detail.get("additions"), "deletions": detail.get("deletions"),
+                    "changed_files": detail.get("changed_files"),
+                    "files_prod": kinds["prod"], "files_test": kinds["test"],
+                    "files_docs": kinds["docs"], "files_ci": kinds["ci"], "files_config": kinds["config"],
+                    "issue_comments": len(others(issue_c)), "review_comments": len(others(review_c)),
+                    "reviews": len(others(reviews)), "reviewers": sorted(reviewers),
+                    "max_review_rounds": max(reviewers.values(), default=0),
+                }
+                score(row)
+                out[author] = (mine, row, None, None)
+        return out
+
+    per_user = {u: {"comments": [], "scored": [], "reviewed": [], "backports": Counter()} for u in users}
     print(f"下載 {len(prs)} 個 PR 的留言（{WORKERS} 個 thread）...", file=sys.stderr)
     pool = ThreadPoolExecutor(max_workers=WORKERS)
     try:
         futures = [pool.submit(process_pr, pr) for pr in prs]
         for n, fut in enumerate(as_completed(futures), 1):
-            mine, row, rv, bp = fut.result()
-            comments.extend(mine)
-            if bp: backports[bp] += 1
-            if row: scored.append(row)
-            if rv: reviewed.append(rv)
+            for u, (mine, row, rv, bp) in fut.result().items():
+                d = per_user[u]
+                d["comments"].extend(mine)
+                if bp: d["backports"][bp] += 1
+                if row: d["scored"].append(row)
+                if rv: d["reviewed"].append(rv)
             if n % 20 == 0 or n == len(prs):
                 print(f"  {n}/{len(prs)}", file=sys.stderr)
     except KeyboardInterrupt:
-        # Ctrl+C 時取消還沒開始的工作，不然 thread 會在背景繼續跑完
         pool.shutdown(wait=False, cancel_futures=True)
         sys.exit("\n已中斷。")
     pool.shutdown()
 
-    for r in scored: r["repo"] = repo
-    for r in reviewed: r["repo"] = repo
-    scored.sort(key=lambda x: -x["score"])
-    reviewed.sort(key=lambda x: -x["score"])
-    by_type = Counter(c["type"] for c in comments)
-    return {
-        "user": user, "repo": repo, "since": since, "until": until,
-        "commits": len(commits), "scored": scored, "reviewed": reviewed,
-        "comment_prs": len({c["pr"] for c in comments}),
-        "issue_comments": by_type["issue_comment"], "review_comments": by_type["review_comment"],
-        "reviews": by_type["review"], "comments_total": len(comments),
-        "backport_own": backports["own"], "backport_review": backports["review"],
-        "reviewed_newcomer": sum(1 for r in reviewed if r["author_association"] in NEWCOMER),
-        "reviewed_acted": sum(1 for r in reviewed if r["acted_on"]),
-        "reviewed_first": sum(1 for r in reviewed if r["first_reviewer"]),
-        "reviewed_noncommitter": sum(1 for r in reviewed if r["author_association"] in NON_COMMITTER),
-        "mentored": sum(1 for r in reviewed if r["mentored"]),
-    }
+    results = {}
+    for u in users:
+        d = per_user[u]
+        scored, reviewed, comments = d["scored"], d["reviewed"], d["comments"]
+        for r in scored: r["repo"] = repo
+        for r in reviewed: r["repo"] = repo
+        scored.sort(key=lambda x: -x["score"])
+        reviewed.sort(key=lambda x: -x["score"])
+        by_type = Counter(c["type"] for c in comments)
+        results[u] = {
+            "user": u, "repo": repo, "since": since, "until": until,
+            "commits": commits_by_user[u], "scored": scored, "reviewed": reviewed,
+            "comment_prs": len({c["pr"] for c in comments}),
+            "issue_comments": by_type["issue_comment"], "review_comments": by_type["review_comment"],
+            "reviews": by_type["review"], "comments_total": len(comments),
+            "backport_own": d["backports"]["own"], "backport_review": d["backports"]["review"],
+            "reviewed_newcomer": sum(1 for r in reviewed if r["author_association"] in NEWCOMER),
+            "reviewed_acted": sum(1 for r in reviewed if r["acted_on"]),
+            "reviewed_first": sum(1 for r in reviewed if r["first_reviewer"]),
+            "reviewed_noncommitter": sum(1 for r in reviewed if r["author_association"] in NON_COMMITTER),
+            "mentored": sum(1 for r in reviewed if r["mentored"]),
+        }
+    return results
 
 
 def quality(rows, what, n, baseline):
@@ -837,16 +922,31 @@ def main():
     _cache_enabled = not a.no_cache
     if a.cache_dir:
         CACHE_DIR = a.cache_dir
+    if _cache_enabled:
+        try:
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            probe = os.path.join(CACHE_DIR, ".write_test")
+            open(probe, "w").close(); os.remove(probe)
+        except OSError as e:
+            print(f"警告：快取目錄 {CACHE_DIR} 無法寫入（{e.strerror}），這次不使用快取", file=sys.stderr)
+            _cache_enabled = False
 
     if not TOKEN:
         sys.exit("未設定 GITHUB_TOKEN，每小時只有 60 次額度，跑不完。請 export GITHUB_TOKEN=... 後再執行。")
 
     if a.config:
         cfg = load_config(a.config)
-        people = [{"user": p["user"], "jira": p.get("jira"), "repos": [normalize_repo(r) for r in p["repos"]]}
-                  for p in cfg["people"]]
         since, until = cfg.get("since") or a.since, cfg.get("until") or a.until
         repo_jira = dict(REPO_JIRA, **{normalize_repo(k): v for k, v in (cfg.get("jira_projects") or {}).items()})
+        if "users" in cfg:
+            # 新格式：每個人都查全部 repo
+            repos = [normalize_repo(r) for r in cfg["repos"]]
+            jira_users = dict(cfg.get("jira") or {})
+            people = [{"user": u, "jira": jira_users.get(u), "repos": repos} for u in cfg["users"]]
+        else:
+            # 舊格式：每個人各自列 repo
+            people = [{"user": p["user"], "jira": p.get("jira"), "repos": [normalize_repo(r) for r in p["repos"]]}
+                      for p in cfg["people"]]
     elif a.repo and a.user:
         people = [{"user": a.user, "jira": a.jira, "repos": [normalize_repo(a.repo)]}]
         since, until = a.since, a.until
@@ -857,18 +957,37 @@ def main():
     until = until or today.isoformat()
     since = since or (today - timedelta(days=DEFAULT_DAYS)).isoformat()
 
-    # 逐人逐 repo 抓
+    # 反轉成 repo → 要查的人，一個 repo 只跑一次
+    repo_users = {}
+    for p in people:
+        for repo in p["repos"]:
+            repo_users.setdefault(repo, []).append(p["user"])
+    jira_users = {p["user"]: p["jira"] for p in people if p.get("jira")}
+
+    first = next((r for r, us in repo_users.items() if len(us) >= 2), None)
+    if first:
+        verify_or_semantics(first, since, repo_users[first])
+
+    # 逐 repo 抓
+    results_by_user = {p["user"]: [] for p in people}
+    skipped = {}
+    for repo, users in repo_users.items():
+        try:
+            for u, res in analyze_repo(repo, users, since, until).items():
+                results_by_user[u].append(res)
+        except RepoInaccessible as e:
+            print(f"  跳過：{e}", file=sys.stderr)
+            skipped[repo] = users
+    for repo in skipped:
+        repo_users.pop(repo)
+    issues_by_user = fetch_all_issues(repo_users, jira_users, since, until, repo_jira)
+
     fetched = []
     for p in people:
-        results = []
-        for repo in p["repos"]:
-            try:
-                results.append(analyze(p["user"], repo, since, until))
-            except RepoInaccessible as e:
-                print(f"  跳過：{e}", file=sys.stderr)
-                p.setdefault("skipped", []).append(repo)
+        results = results_by_user[p["user"]]
+        p["skipped"] = [r for r, us in skipped.items() if p["user"] in us]
         if results:
-            p["issues"] = fetch_person_issues(p, since, until, repo_jira)
+            p["issues"] = issues_by_user.get(p["user"], [])
             fetched.append((p, results))
         else:
             print(f"  {p['user']} 沒有任何可存取的 repo，略過", file=sys.stderr)
@@ -905,9 +1024,8 @@ def main():
            "## 總表（依數量分排序）", "",
            "| 人 | 數量分 | 品質分 | PR（merge） | Review PR | 深度 review | 帶非 committer | 開題目（被別人解） | 主要 repo |",
            "|---|---|---|---|---|---|---|---|---|"]
-    skipped = [f"{p['user']}：{', '.join(p['skipped'])}" for p, *_ in rows if p.get("skipped")]
     if skipped:
-        out.insert(3, "無法存取而跳過的 repo：" + "；".join(skipped))
+        out.insert(3, "無法存取而跳過的 repo：" + "、".join(skipped))
     for p, m, results, scored, reviewed, stats in rows:
         out.append(f"| {p['user']} | {m['total']:+.1f} | {fmt(m['q_total'])} | {m['n_pr']}（{m['n_merged']}） "
                    f"| {m['n_reviewed']} | {m['deep_reviews']} | {stats['mentored']} "
