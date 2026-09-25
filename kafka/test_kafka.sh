@@ -100,6 +100,8 @@ echo "⚙️  資源限制: CPU: $TARGET_CPU 核心, 記憶體: $TARGET_MEM"
 echo "---------------------------------------------------"
 
 podman run --rm -it \
+  --init \
+  --stop-timeout=0 \
   --userns=keep-id \
   --cpus="$TARGET_CPU" \
   --memory="$TARGET_MEM" \
