@@ -29,11 +29,5 @@
     "kubernetes/kubernetes",
     "ray-project/ray",
     "ray-project/kuberay"
-  ],
-  "jira": {
-    "chungen0126": "chungen",
-    "chia7712": "chia7712",
-    "chenyulin0719": "Yu-Lin Chen",
-    "HuangTing-Yao": "tingyao"
-  }
+  ]
 }

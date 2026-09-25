@@ -3,6 +3,9 @@
 下載指定 GitHub 帳號在指定 repo 的活動紀錄，並替他開的 PR 算一個「重要性」分數。
 
 只在終端機印出統計摘要。API 回應會連同 ETag 存在 ~/.cache/gh_activity/，重跑時沒變的回 304，不扣額度。
+另外每個 PR 抓到的原始資料也會存一份（~/.cache/gh_activity/pr/），搜尋結果裡的 updated_at 沒變的 PR
+整包重用、一個請求都不發，所以重跑只會重抓這段時間有動過的 PR。
+stderr 會印每個階段的秒數、請求數、304 命中數和等待額度的時間，方便看時間花在哪。
 
 用法：
   export GITHUB_TOKEN=ghp_xxx
@@ -16,19 +19,21 @@ people.json 格式（每個人都查全部 repo）：
     "since": "2026-08-03",            # 可省略
     "until": "2026-09-17",            # 可省略
     "users": ["jason810496", "chia7712"],
-    "repos": ["apache/airflow", "apache/kafka"],
-    "jira": {"chia7712": "chia7712"},                  # 可省略，GitHub 帳號 → JIRA 帳號
-    "jira_projects": {"apache/some-repo": "SOMEKEY"}   # 可省略，覆蓋或新增 repo → JIRA 專案的對應
+    "repos": ["apache/airflow", "apache/kafka"]
   }
-  舊格式（每個人各自列 repo）也接受：{"people": [{"user": "...", "repos": [...], "jira": "..."}]}
+  舊格式（每個人各自列 repo）也接受：{"people": [{"user": "...", "repos": [...]}]}
 
 搜尋是一個 repo 一次搜一批人（重複的 author: 是「或」），每個 PR 的留言只抓一次再拆給有參與的人，
 所以人數多的時候比一個人一個 repo 分開跑省很多搜尋額度。
+搜尋走 GraphQL：REST 的搜尋每分鐘只有 30 次，GraphQL 走每小時 5000 點的額度（一頁約 1 點），
+而且一個請求可以用 alias 塞 SEARCHES_PER_REQUEST 個搜尋。其他資料（留言、reviews、files）仍走 REST，有 ETag 快取。
 
-開題目：repo 有對應的 JIRA 專案（REPO_JIRA）就查 ASF JIRA（需要 jira 帳號），否則查 GitHub Issues。
-JIRA 匿名可讀，被限速時可設 JIRA_TOKEN（JIRA Profile → Personal Access Tokens）。
+總分 = review 分 + 重要 PR 分 + 一般 PR 分，目標排序是
+  review ≈ 重要貢獻 > 一般貢獻
+一個 PR 先算「重要性」分數（有沒有 production code、討論多深、改動多大），達 IMPORTANT_PR_MIN 的全額計入，
+未達的打折；沒 merge 的 PR 先算 1/4，被關掉的不計。
 
-多 repo 的合併規則：數量分各 repo 相加；品質分把該人所有 repo 的 PR 放在一起取前 N。
+多 repo 的合併規則：總分各 repo 相加；品質分把該人所有 repo 的 PR 放在一起取前 N。
 """
 import argparse, hashlib, http.client, json, math, os, re, sys, threading, time, unicodedata, urllib.parse, urllib.request, urllib.error
 from collections import Counter
@@ -36,7 +41,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 
 API = "https://api.github.com"
+GRAPHQL = "https://api.github.com/graphql"
 TOKEN = os.environ.get("GITHUB_TOKEN")
+SEARCHES_PER_REQUEST = 5    # 一個 GraphQL 請求裡用 alias 塞幾個搜尋（每個搜尋一頁 100 筆約 1 點）。
+                            # GitHub 是逐個處理，塞越多單一請求越慢，所以塞少一點、多個請求同時送
+SEARCH_WORKERS = 10         # 同時送幾個 GraphQL 搜尋請求。126 人 × 3 種關係約 40 個搜尋 = 8 個請求，10 個 worker 一輪跑完
 
 # ---- 權重，自行調整 ----------------------------------------------------------
 WEIGHTS = {
@@ -44,31 +53,49 @@ WEIGHTS = {
     "no_prod_code": 0.5,       # 只動 test / docs / ci / config，給少少的分
     # 討論深度用連續值，讓大 PR 有機會拿高分（reviewer 人數不算分，那只反映 repo 的 review 慣例）：
     "discussion_log": True,    # + log2(1 + 別人在這個 PR 上的留言數)：5 則 ≈ 2.6、20 則 ≈ 4.4、80 則 ≈ 6.3
+    # 改動規模（只算有 production code 的 PR）：+ 0.5 × log2(1 + 增刪行數 / 50)，最多 +3
+    # 50 行 ≈ 0.5、300 行 ≈ 1.4、1000 行 ≈ 2.2
+    "size_log_scale": 0.5,
+    "size_unit": 50,
+    "size_cap": 3.0,
     "trivial_title": -2,       # 標題以 MINOR / HOTFIX / typo 開頭
     "merged_under_2h": -1,
+}
+# ---- 總分怎麼組成 -----------------------------------------------------------
+# 總分 = review 分 + 重要 PR 分 + 一般 PR 分
+# 目標排序：review ≈ 重要貢獻 > 一般貢獻。大致的單位分數：
+#   實質 review（幾則行內意見、approve 且 merge）≈ 4～6，深度 review（行內 ≥ DEEP_REVIEW_INLINE）≈ 8～10，
+#   帶非 committer 再 +8；只按 approve 的 review ≈ 1
+#   重要 PR（prod code、有討論、有規模）≈ 4～8；一般 PR 乘 0.5 ≈ 0.5～1.5
+#   也就是：帶一個非 committer 的 PR 到 merge ≈ 兩個重要 PR；深度 review ≈ 重要 PR；純 approve 幾乎不計
+IMPORTANT_PR_MIN = 4.0     # PR 重要性分數達此值算「重要貢獻」。約等於 prod code 且（3 則討論 + 300 行，或 5 則討論 + 50 行）
+PR_BUCKET_FACTOR = {"important": 1.0, "general": 0.5}
+PR_STATE_FACTOR = {
+    "merged": 1.0,
+    "open": 0.25,     # 還沒 merge 的先算 1/4，merge 後補齊（不鼓勵灌 PR）
+    "closed": 0.0,    # 關掉沒 merge 的不計分
 }
 WORKERS = 8         # 同時下載的 thread 數。每個 thread 一條持久連線；超過 10 可能觸發 secondary rate limit
 DEFAULT_DAYS = 60   # 未指定 --since/--until 時，看過去幾天
 QUALITY_TOP_N_PR = 5       # 自己開的 PR 品質分：取分數最高的幾個平均
 QUALITY_TOP_N_REVIEW = 5   # Review 品質分：同上。取 5 個而不是 10 個，讓最好的幾個 review 能拉開差距
-DEEP_REVIEW_INLINE = 10    # 行內留言達這個數量算「深度 review」，總表單獨列出個數
+DEEP_REVIEW_INLINE = 10    # 行內留言達這個數量算「深度 review」，總表單獨列出個數，並額外加 REVIEW_WEIGHTS["deep_review"]
 # Review 品質 = 深度（前 N 名平均）＋ 廣度。廣度用對數，只區分量級，不線性放大（量已在數量分算過）
 REVIEW_BREADTH = {
     "substantive_log": 1.0,   # + log2(1 + 實質 review 數)：有行內意見、request changes 或 40 字以上結論的 review
     "mentored_log": 1.5,      # + 1.5 × log2(1 + 帶非 committer 數)
-    "issues_by_others_log": 1.0,  # + log2(1 + 開的題目被別人解掉的數)
 }
 # 樣本不足 N 個時，缺的名額用基準值補（拉向一般水準，不當 0 也不當高估）。
 # 多人模式的基準值是全體受評者的中位數；單人模式用這裡的固定值。
 BASELINE_PR_DEFAULT = 1.0      # 一個普通的 production code PR
-BASELINE_REVIEW_DEFAULT = 2.0  # 一個純 approve 且 merge 的 review
+BASELINE_REVIEW_DEFAULT = 1.0  # 一個純 approve 且 merge 的 review（= REVIEW_WEIGHTS["approved_merged"]）
 
 # ---- Review 活動的權重（只算別人開的 PR）------------------------------------
 REVIEW_WEIGHTS = {
     "review_comment": 1.0,      # 程式碼行內留言，每則
     "issue_comment": 0.5,       # PR 下方一般留言，每則
     "review_body": 1.0,         # 有文字內容的 review 結論，每則
-    "approved_merged": 2.0,     # 給了 approve 且 PR 後來有 merge（每個 PR 一次）
+    "approved_merged": 1.0,     # 給了 approve 且 PR 後來有 merge（每個 PR 一次）。原 2.0；降低是為了讓純 approve 不值錢，實質意見才有分
     "changes_requested": 2.0,   # 給過 request changes（每個 PR 一次）
     "short_factor": 0.25,       # 少於 SHORT_LEN 字的留言（LGTM、+1 之類）打折
     # 留言累加後取對數再乘 comment_log_scale：1.5 × log2(1 + 累加值)。
@@ -77,7 +104,8 @@ REVIEW_WEIGHTS = {
     "comment_log_scale": 1.5,
     "first_reviewer": 1.0,      # 這個 PR 上第一個留下實質意見的人（行內、request changes、或 40 字以上結論；純 approve 不算）
     "acted_on": 1.0,            # 留下實質意見後 PR 有再 push 新 commit（可能是 review 起了作用，訊號不確定所以分數低，每個 PR 一次）
-    "mentored": 4.0,            # 帶非 committer：作者不是 committer、本人留 MENTOR_MIN_INLINE 則以上行內意見或 request changes、PR 最後 merge
+    "mentored": 8.0,            # 帶非 committer：作者不是 committer、本人留 MENTOR_MIN_INLINE 則以上行內意見或 request changes、PR 最後 merge。原 4.0
+    "deep_review": 3.0,         # 深度 review：行內留言達 DEEP_REVIEW_INLINE 則（每個 PR 一次）。留言的對數分壓得很扁，這裡把深度拉開
     "newcomer_factor": 1.5,     # 作者是第一次貢獻者或沒有關聯的人，留言深度的部分乘上這個倍數（固定加分不乘）
     "contributor_factor": 1.2,  # 作者是非 committer 的貢獻者
 }
@@ -92,25 +120,6 @@ BOT_LOGINS = {"k8s-ci-robot", "k8s-triage-robot", "k8s-bot", "kubernetes-bot", "
 def is_bot(login):
     return not login or login.endswith("[bot]") or login.lower() in BOT_LOGINS
 
-# ---- 開題目（GitHub Issues 或 ASF JIRA）--------------------------------------
-JIRA_API = "https://issues.apache.org/jira/rest/api/2"
-JIRA_TOKEN = os.environ.get("JIRA_TOKEN")   # 可選，匿名也能讀公開專案
-# repo → JIRA 專案 key。有對應的 repo 用 JIRA，沒有的用 GitHub Issues。people.json 的 jira_projects 可覆蓋
-REPO_JIRA = {
-    "apache/kafka": "KAFKA", "apache/kafka-site": "KAFKA", "apache/kafka-private": "KAFKA",
-    "apache/ozone": "HDDS",
-    "apache/yunikorn-core": "YUNIKORN", "apache/yunikorn-k8shim": "YUNIKORN",
-    "apache/yunikorn-scheduler-interface": "YUNIKORN", "apache/yunikorn-web": "YUNIKORN",
-    "apache/yunikorn-site": "YUNIKORN", "apache/yunikorn-release": "YUNIKORN",
-}
-ISSUE_WEIGHTS = {
-    "opened": 0.5,             # 開一個題目。開 ticket 很容易，重心放在後面「被解掉」那幾分
-    "solved": 2.0,             # 題目被解掉（JIRA resolution 是 Fixed/Done 等；GitHub issue 以 completed 關閉）
-    "solved_by_other": 1.0,    # 解掉的人不是自己（開題目給別人做）
-    "discussed_3": 1.0,        # 有 3 則以上留言討論
-}
-JIRA_RESOLVED_OK = {"fixed", "done", "implemented", "resolved", "delivered", "information provided"}
-ISSUE_MIN_COMMENTS = 3
 SHORT_LEN = 40
 CONFIG_FILES = {"pom.xml", "build.gradle", "settings.gradle", "gradlew", "gradlew.bat", "package.json",
                 "package-lock.json", "requirements.txt", "pyproject.toml", "setup.py", "makefile",
@@ -139,10 +148,44 @@ def _cache_path(url):
     return os.path.join(CACHE_DIR, hashlib.sha1(url.encode()).hexdigest() + ".json")
 
 
+# ---- 計時與請求計數，只用來印在 stderr -----------------------------------------
+_stats, _stats_lock = Counter(), threading.Lock()
+
+
+def _count(**kw):
+    with _stats_lock:
+        for k, v in kw.items():
+            _stats[k] += v
+
+
+def _snapshot():
+    with _stats_lock:
+        return dict(_stats)
+
+
+def _elapsed(t0, s0):
+    """從 t0 / s0 到現在：秒數、請求數、304 命中、等待額度、PR 快取命中。"""
+    s1 = _snapshot()
+    d = {k: s1.get(k, 0) - s0.get(k, 0) for k in ("requests", "not_modified", "wait", "pr_cached", "pr_fetched")}
+    parts = [f"{d['requests']} 次請求"]
+    if d["not_modified"]:
+        parts.append(f"304 命中 {d['not_modified']}")
+    if d["wait"]:
+        parts.append(f"等待額度 {d['wait']:.0f}s")
+    if d["pr_cached"] or d["pr_fetched"]:
+        parts.append(f"PR 沒變直接用快取 {d['pr_cached']}、重抓 {d['pr_fetched']}")
+    return f"{time.time() - t0:.1f}s（{'、'.join(parts)}）"
+
+
+def _wait(seconds):
+    _count(wait=seconds)
+    time.sleep(seconds)
+
+
 _local = threading.local()
 
 
-def _request(url, headers):
+def _request(url, headers, method="GET", body=None):
     """用每個 thread 各自的持久連線送請求（keep-alive，省掉每次 TLS 握手）。
     回傳 (status, headers, body_bytes)。"""
     u = urllib.parse.urlsplit(url)
@@ -155,7 +198,7 @@ def _request(url, headers):
     path = u.path + ("?" + u.query if u.query else "")
     for attempt in (1, 2):
         try:
-            conn.request("GET", path, headers=headers)
+            conn.request(method, path, body=body, headers=headers)
             resp = conn.getresponse()
             return resp.status, resp.headers, resp.read()
         except (http.client.HTTPException, OSError):
@@ -183,6 +226,7 @@ def get(url, params=None, accept="application/vnd.github+json"):
             cached = None
     while True:
         status, h, body = _request(url, headers)
+        _count(requests=1)
         if status == 200:
             nxt = None
             for part in h.get("Link", "").split(","):
@@ -197,40 +241,114 @@ def get(url, params=None, accept="application/vnd.github+json"):
                 os.replace(tmp, _cache_path(url))
             return data, nxt
         if status == 304 and cached:
+            _count(not_modified=1)
             return cached["data"], cached.get("next")
         if status in (301, 302, 307, 308) and h.get("Location"):
             url = h["Location"]
             continue
-        if status in (403, 429):
-            try:
-                msg = json.loads(body.decode()).get("message", "")
-            except Exception:
-                msg = ""
-            if h.get("Retry-After"):
-                wait = int(h["Retry-After"]) + 1
-                why = "secondary rate limit（Retry-After）"
-            elif "secondary" in msg.lower() or "abuse" in msg.lower():
-                wait = 60
-                why = "secondary rate limit（請求太密集）"
-            elif h.get("X-RateLimit-Remaining") == "0":
-                if h.get("X-RateLimit-Limit") == "60":
-                    sys.exit(f"這個請求被當成未登入（額度上限 60）：{url}\n"
-                             "token 對這個 repo 無效。fine-grained token 請把 Repository access 設為 "
-                             "Public repositories (read-only)，或改用 classic token。")
-                wait = int(h.get("X-RateLimit-Reset", time.time() + 60)) - int(time.time()) + 5
-                why = f"主要額度用完（{h.get('X-RateLimit-Resource', 'core')}）"
-            else:
-                wait = 60
-                why = f"HTTP {status}"
-            print(f"  {why}，等待 {wait}s ... {msg[:80]}", file=sys.stderr)
-            time.sleep(max(wait, 5))
-            continue
-        if status >= 500:
-            print(f"  HTTP {status}，10 秒後重試：{url}", file=sys.stderr)
-            time.sleep(10)
+        w = _retry_wait(status, h, body, url)
+        if w is not None:
+            _wait(w)
             continue
         print(f"  HTTP {status}: {url}", file=sys.stderr)
         raise RuntimeError(f"HTTP {status}: {url} {body[:200]!r}")
+
+
+def _retry_wait(status, h, body, url):
+    """403 / 429 / 5xx：印出原因，回傳該等幾秒後重試；其他狀態回傳 None。REST 和 GraphQL 共用。"""
+    if status in (403, 429):
+        try:
+            msg = json.loads(body.decode()).get("message", "")
+        except Exception:
+            msg = ""
+        if h.get("Retry-After"):
+            wait = int(h["Retry-After"]) + 1
+            why = "secondary rate limit（Retry-After）"
+        elif "secondary" in msg.lower() or "abuse" in msg.lower():
+            wait = 60
+            why = "secondary rate limit（請求太密集）"
+        elif h.get("X-RateLimit-Remaining") == "0":
+            if h.get("X-RateLimit-Limit") == "60":
+                sys.exit(f"這個請求被當成未登入（額度上限 60）：{url}\n"
+                         "token 對這個 repo 無效。fine-grained token 請把 Repository access 設為 "
+                         "Public repositories (read-only)，或改用 classic token。")
+            wait = int(h.get("X-RateLimit-Reset", time.time() + 60)) - int(time.time()) + 5
+            why = f"主要額度用完（{h.get('X-RateLimit-Resource', 'core')}）"
+        else:
+            wait = 60
+            why = f"HTTP {status}"
+        print(f"  {why}，等待 {wait}s ... {msg[:80]}", file=sys.stderr)
+        return max(wait, 5)
+    if status >= 500:
+        print(f"  HTTP {status}，10 秒後重試：{url}", file=sys.stderr)
+        return 10
+    return None
+
+
+def graphql(query, variables):
+    """POST 一個 GraphQL 查詢，處理額度（header 的 403 和 body 裡的 RATE_LIMITED 都有可能），回傳 data。"""
+    payload = json.dumps({"query": query, "variables": variables}).encode()
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": "gh-activity",
+               "Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}
+    while True:
+        status, h, body = _request(GRAPHQL, headers, "POST", payload)
+        _count(requests=1)
+        if status == 200:
+            resp = json.loads(body.decode())
+            errors = resp.get("errors") or []
+            if any(e.get("type") == "RATE_LIMITED" for e in errors):
+                wait = max(int(h.get("X-RateLimit-Reset", time.time() + 60)) - int(time.time()) + 5, 5)
+                print(f"  GraphQL 額度用完，等待 {wait}s ...", file=sys.stderr)
+                _wait(wait)
+                continue
+            if errors:
+                raise RuntimeError("GraphQL 錯誤：" + "；".join(e.get("message", "?") for e in errors))
+            return resp["data"]
+        w = _retry_wait(status, h, body, GRAPHQL)
+        if w is not None:
+            _wait(w)
+            continue
+        raise RuntimeError(f"GraphQL HTTP {status}: {body[:200]!r}")
+
+
+# 搜尋結果只取後面會用到的欄位。不抓 labels：它會讓每頁成本從 1 點變 11 點，而且目前沒有用到
+SEARCH_FIELDS = """issueCount pageInfo { hasNextPage endCursor }
+    nodes { ... on PullRequest { number title url state createdAt updatedAt mergedAt authorAssociation
+                                 author { login } comments { totalCount } } }"""
+
+
+def _search_batch(batch):
+    """batch 是 [(搜尋字串, cursor)]，一個 GraphQL 請求送完，回傳 [(搜尋字串, 該頁結果)]。"""
+    decl = ", ".join(f"$q{i}: String!, $c{i}: String" for i in range(len(batch)))
+    parts = " ".join(f"s{i}: search(query: $q{i}, type: ISSUE, first: 100, after: $c{i}) {{ {SEARCH_FIELDS} }}"
+                     for i in range(len(batch)))
+    variables = {}
+    for i, (q, cursor) in enumerate(batch):
+        variables[f"q{i}"], variables[f"c{i}"] = q, cursor
+    data = graphql(f"query({decl}) {{ {parts} }}", variables)
+    return [(q, data[f"s{i}"]) for i, (q, _) in enumerate(batch)]
+
+
+def search_many(queries):
+    """一次送多個搜尋字串：每 SEARCHES_PER_REQUEST 個塞成一個 GraphQL 請求（alias），
+    最多 SEARCH_WORKERS 個請求同時送，各自翻頁到完。
+    回傳 {搜尋字串: (items, issueCount)}。issueCount 是真正的總數，超過 1000 表示結果被截斷。"""
+    results = {q: ([], 0) for q in queries}
+    pending = {q: None for q in queries}   # 搜尋字串 → 下一頁的 cursor
+    while pending:
+        todo = list(pending.items())
+        batches = [todo[i:i + SEARCHES_PER_REQUEST] for i in range(0, len(todo), SEARCHES_PER_REQUEST)]
+        with ThreadPoolExecutor(max_workers=SEARCH_WORKERS) as pool:
+            pages = [p for out in pool.map(_search_batch, batches) for p in out]
+        for q, r in pages:
+            items, _ = results[q]
+            items.extend(n for n in r["nodes"] if n)   # is:pr 之外的 node 會是空物件
+            results[q] = (items, r["issueCount"])
+            if r["pageInfo"]["hasNextPage"]:
+                pending[q] = r["pageInfo"]["endCursor"]
+            else:
+                del pending[q]
+    return results
 
 
 def get_all(url, params=None, key=None, accept="application/vnd.github+json"):
@@ -279,6 +397,10 @@ def score(pr):
     if WEIGHTS["discussion_log"] and discussion > 0:
         d = math.log2(1 + discussion)
         s += d; reasons.append(f"discussion({discussion})+{d:.1f}")
+    lines = (pr.get("additions") or 0) + (pr.get("deletions") or 0)
+    if pr["files_prod"] > 0 and lines > 0:
+        z = min(WEIGHTS["size_cap"], WEIGHTS["size_log_scale"] * math.log2(1 + lines / WEIGHTS["size_unit"]))
+        s += z; reasons.append(f"size({lines})+{z:.1f}")
     if TRIVIAL_TITLE.match(pr["title"]):
         s += WEIGHTS["trivial_title"]; reasons.append("trivial_title")
     if pr["hours_to_merge"] is not None and pr["hours_to_merge"] < 2:
@@ -287,11 +409,17 @@ def score(pr):
         reasons.append(f"floor({s:+g})")
         s = MIN_PR_SCORE
     pr["score"], pr["score_reasons"] = round(s, 2), reasons
+    # 計入總分的分數：重要 PR 全額、一般 PR 打折；沒 merge 的再依狀態打折
+    pr["important"] = s >= IMPORTANT_PR_MIN
+    pr["bucket"] = "important" if pr["important"] else "general"
+    state = "merged" if pr["merged_at"] else ("open" if pr.get("state") == "open" else "closed")
+    pr["pr_state"] = state
+    pr["counted"] = round(s * PR_BUCKET_FACTOR[pr["bucket"]] * PR_STATE_FACTOR[state], 2)
 
 
 def review_score(pr, mine, acted_on=False, first_reviewer=False):
     """mine 是本人在這個（別人開的）PR 上的留言，回傳該 PR 的 review 分數。
-    分數 = 留言深度（對數、非 committer 倍率）＋ 固定加分（approve 且 merge、request changes、首評、帶非 committer、起作用）。"""
+    分數 = 留言深度（對數、非 committer 倍率）＋ 固定加分（approve 且 merge、request changes、首評、深度 review、帶非 committer、起作用）。"""
     W = REVIEW_WEIGHTS
     depth, cnt = 0.0, Counter()
     for c in mine:
@@ -321,7 +449,10 @@ def review_score(pr, mine, acted_on=False, first_reviewer=False):
         s += W["changes_requested"]; reasons.append("changes_requested")
     if first_reviewer:
         s += W["first_reviewer"]; reasons.append("first_reviewer")
-    mentored = (assoc in NON_COMMITTER and pr["merged_at"]
+    deep = cnt["review_comment"] >= DEEP_REVIEW_INLINE
+    if deep:
+        s += W["deep_review"]; reasons.append("deep_review")
+    mentored =(assoc in NON_COMMITTER and pr["merged_at"]
                 and (cnt["review_comment"] >= MENTOR_MIN_INLINE or "CHANGES_REQUESTED" in states))
     if mentored:
         s += W["mentored"]; reasons.append("mentored")
@@ -339,119 +470,6 @@ def review_score(pr, mine, acted_on=False, first_reviewer=False):
         "short_comments": short_n,
         "score": round(s, 2), "score_reasons": reasons,
     }
-
-
-def issue_score(row):
-    W, s, reasons = ISSUE_WEIGHTS, ISSUE_WEIGHTS["opened"], []
-    if row["closed_bad"]:
-        row["score"], row["score_reasons"] = 0, ["closed_as_" + row["resolution"]]
-        return row
-    if row["solved"]:
-        s += W["solved"]; reasons.append("solved")
-        if row["by_other"]:
-            s += W["solved_by_other"]; reasons.append("by_other")
-    if row["comments"] >= ISSUE_MIN_COMMENTS:
-        s += W["discussed_3"]; reasons.append(f"discussed({row['comments']})")
-    row["score"], row["score_reasons"] = s, reasons
-    return row
-
-
-def jira_get(path, params):
-    headers = {"Accept": "application/json", "User-Agent": "gh-activity"}
-    if JIRA_TOKEN:
-        headers["Authorization"] = f"Bearer {JIRA_TOKEN}"
-    url = f"{JIRA_API}/{path}?" + urllib.parse.urlencode(params)
-    for attempt in range(5):
-        status, h, body = _request(url, headers)
-        if status == 200:
-            return json.loads(body.decode())
-        if status in (429, 503):
-            wait = int(h.get("Retry-After", 30)) + 1
-            print(f"  JIRA 限速（HTTP {status}），等待 {wait}s ...", file=sys.stderr)
-            time.sleep(wait)
-            continue
-        raise RuntimeError(f"JIRA HTTP {status}: {url} {body[:200]!r}")
-    raise RuntimeError(f"JIRA 重試多次仍失敗：{url}")
-
-
-def fetch_jira_issues(jira_user, project, since, until):
-    """這個人在 JIRA 專案裡、區間內開的 ticket。"""
-    print(f"JIRA {project}：查 {jira_user} 開的 ticket ...", file=sys.stderr)
-    jql = f'project = {project} AND reporter = "{jira_user}" AND created >= "{since}" AND created <= "{until} 23:59"'
-    rows, start = [], 0
-    while True:
-        data = jira_get("search", {"jql": jql, "startAt": start, "maxResults": 100,
-                                   "fields": "summary,created,resolution,status,assignee,reporter,comment"})
-        for it in data.get("issues", []):
-            f = it["fields"]
-            res = ((f.get("resolution") or {}).get("name") or "").strip()
-            assignee = (f.get("assignee") or {}).get("name") or (f.get("assignee") or {}).get("key") or ""
-            solved = res.lower() in JIRA_RESOLVED_OK
-            closed_bad = bool(res) and not solved
-            rows.append(issue_score({
-                "source": "jira", "key": it["key"], "title": f.get("summary", ""),
-                "url": f"https://issues.apache.org/jira/browse/{it['key']}",
-                "created": f.get("created", ""), "resolution": res or "unresolved",
-                "solved": solved, "closed_bad": closed_bad,
-                "by_other": solved and assignee.lower() != jira_user.lower(),
-                "comments": (f.get("comment") or {}).get("total", 0),
-            }))
-        start += 100
-        if start >= data.get("total", 0):
-            break
-    return rows
-
-
-def fetch_github_issues(repo, users, since, until):
-    """一群人在 GitHub repo 裡、區間內開的 issue（不含 PR），分批搜，回傳 {user: rows}。"""
-    print(f"GitHub Issues {repo}：查 {len(users)} 人開的 issue ...", file=sys.stderr)
-    base = f"is:issue repo:{repo} created:{since}..{until}"
-    rows = {u: [] for u in users}
-    for batch in user_batches(users, base, "author"):
-        for it in search_users(base, "author", batch):
-            user = it["user"]["login"]
-            if user not in rows:
-                continue
-            reason = it.get("state_reason") or ""
-            solved = it["state"] == "closed" and reason == "completed"
-            closed_bad = it["state"] == "closed" and not solved
-            assignees = {(a or {}).get("login", "").lower() for a in (it.get("assignees") or [])}
-            rows[user].append(issue_score({
-                "source": "github", "key": f"{repo}#{it['number']}", "title": it["title"], "url": it["html_url"],
-                "created": it["created_at"], "resolution": reason or ("open" if it["state"] == "open" else "closed"),
-                "solved": solved, "closed_bad": closed_bad,
-                "by_other": solved and (not assignees or user.lower() not in assignees),
-                "comments": it.get("comments", 0),
-            }))
-    return rows
-
-
-def fetch_all_issues(repo_users, jira_users, since, until, repo_jira):
-    """所有人開的題目。GitHub Issues 依 repo 分批查；JIRA 依 (帳號, 專案) 各查一次。回傳 {user: rows}。"""
-    out = {}
-    jira_done = set()
-    for repo, users in repo_users.items():
-        key = repo_jira.get(repo)
-        if key is None:
-            for u, rows in fetch_github_issues(repo, users, since, until).items():
-                out.setdefault(u, []).extend(rows)
-            continue
-        for u in users:
-            jira_user = jira_users.get(u)
-            if not jira_user:
-                continue
-            if (u, key) in jira_done:
-                continue
-            jira_done.add((u, key))
-            try:
-                out.setdefault(u, []).extend(fetch_jira_issues(jira_user, key, since, until))
-            except RuntimeError as e:
-                print(f"  JIRA 查詢失敗，略過：{e}", file=sys.stderr)
-    missing = sorted({u for repo, users in repo_users.items() if repo_jira.get(repo)
-                      for u in users if not jira_users.get(u)})
-    if missing:
-        print(f"  以下帳號沒有設定 jira，JIRA 專案的開題目略過：{', '.join(missing)}", file=sys.stderr)
-    return {u: sorted(rows, key=lambda x: -x["score"]) for u, rows in out.items()}
 
 
 def _width(text):
@@ -564,7 +582,7 @@ def ensure_quota(repo, min_needed=300):
         wait = reset - int(time.time()) + 5
         print(f"額度剩 {remaining}/{limit}，等到 {datetime.fromtimestamp(reset).strftime('%H:%M')} "
               f"重置後繼續（約 {wait // 60} 分鐘）...", file=sys.stderr)
-        time.sleep(max(wait, 5))
+        _wait(max(wait, 5))
 
 
 SEARCH_QUERY_MAX = 256   # GitHub 搜尋字串上限
@@ -583,17 +601,32 @@ def user_batches(users, base_query, rel):
     return batches
 
 
-def search_users(base_query, rel, users):
-    """一次搜一批帳號（重複的 rel: 是「或」的關係）。撞到 1000 筆上限就把這批對半拆開重搜。"""
-    q = base_query + "".join(f" {rel}:{u}" for u in users)
-    found = get_all(f"{API}/search/issues", {"q": q}, key="items")
-    if len(found) >= 1000:
-        if len(users) == 1:
-            print(f"  警告：{rel}:{users[0]} 搜尋結果達 1000 筆上限，請縮小日期區間", file=sys.stderr)
-            return found
-        mid = len(users) // 2
-        return search_users(base_query, rel, users[:mid]) + search_users(base_query, rel, users[mid:])
-    return found
+def search_prs(repo, since, users):
+    """搜出這群人在 repo 裡開過、留言過、review 過的 PR（去重）。回傳 (pr 清單, 搜尋次數)。
+    三種關係各分批，所有批次一起丟給 search_many；撞到 1000 筆上限的批次對半拆開重搜。"""
+    base = f"is:pr repo:{repo} updated:>={since}"
+    todo = [(rel, batch) for rel in ("author", "commenter", "reviewed-by") for batch in user_batches(users, base, rel)]
+    found, n_queries = {}, 0
+    while todo:
+        qs = {base + "".join(f" {rel}:{u}" for u in batch): (rel, batch) for rel, batch in todo}
+        n_queries += len(qs)
+        todo = []
+        for q, (items, total) in search_many(list(qs)).items():
+            rel, batch = qs[q]
+            if total > 1000 and len(batch) > 1:
+                mid = len(batch) // 2
+                todo += [(rel, batch[:mid]), (rel, batch[mid:])]
+                continue
+            if total > 1000:
+                print(f"  警告：{rel}:{batch[0]} 搜尋結果超過 1000 筆上限，請縮小日期區間", file=sys.stderr)
+            for i in items:
+                found.setdefault(i["number"], i)
+    prs = [{"number": i["number"], "title": i["title"], "author": (i.get("author") or {}).get("login") or "ghost",
+            "state": i["state"].lower(), "created_at": i["createdAt"], "updated_at": i["updatedAt"],
+            "url": i["url"], "merged_at": i.get("mergedAt"),
+            "n_issue_comments": i["comments"]["totalCount"], "author_association": i.get("authorAssociation")}
+           for i in found.values()]
+    return prs, n_queries
 
 
 def verify_or_semantics(repo, since, users):
@@ -601,49 +634,74 @@ def verify_or_semantics(repo, since, users):
     if len(users) < 2:
         return
     base = f"is:pr repo:{repo} updated:>={since}"
-    def count(q):
-        data, _ = get(f"{API}/search/issues", {"q": q, "per_page": 1})
-        return data.get("total_count", 0)
-    single = count(f"{base} author:{users[0]}")
-    both = count(f"{base} author:{users[0]} author:{users[1]}")
-    if both < single:
+    single, both = f"{base} author:{users[0]}", f"{base} author:{users[0]} author:{users[1]}"
+    res = search_many([single, both])
+    if res[both][1] < res[single][1]:
         sys.exit("GitHub 搜尋對重複的 author: 不是「或」的語意，無法批次搜尋。請回報這個問題。")
 
 
-def analyze_repo(repo, users, since, until):
+class PRCache:
+    """一個 PR 的原始 API 回應（留言、reviews、commits、detail、files）。
+    以搜尋結果的 updated_at 當版本：GitHub 在有新留言、review、commit、merge、關閉時都會更新它，
+    沒變就整包重用、一個請求都不發。每個欄位是需要時才抓（lazy），所以受評者名單變了也只會補抓缺的部分。"""
+
+    def __init__(self, repo, pr):
+        self.path = os.path.join(CACHE_DIR, "pr", hashlib.sha1(f"{repo}#{pr['number']}".encode()).hexdigest() + ".json")
+        self.updated_at = pr.get("updated_at")
+        self.data, self.dirty = {}, False
+        if _cache_enabled and self.updated_at and os.path.exists(self.path):
+            try:
+                c = json.load(open(self.path))
+                if c.get("updated_at") == self.updated_at:
+                    self.data = c["data"]
+            except (ValueError, KeyError, OSError):
+                pass
+
+    def get(self, key, fetch):
+        if key not in self.data:
+            self.data[key] = fetch(); self.dirty = True
+        return self.data[key]
+
+    def save(self):
+        _count(pr_fetched=1) if self.dirty else _count(pr_cached=1)
+        if not (_cache_enabled and self.dirty and self.updated_at):
+            return
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            tmp = self.path + ".tmp"
+            json.dump({"updated_at": self.updated_at, "data": self.data}, open(tmp, "w"))
+            os.replace(tmp, self.path)
+        except OSError:
+            pass
+
+
+def analyze_repo(repo, users, since, until, with_commits=True):
     """抓一群人在一個 repo 的活動，回傳 {user: 統計結果}。
-    搜尋是分批合併查的，每個 PR 的留言只抓一次，再拆給有參與的人。"""
+    搜尋是分批合併查的，每個 PR 的留言只抓一次，再拆給有參與的人。
+    with_commits=False 時跳過 commits（commit 數只在 --detail 和單人模式才會印，總表用不到）。"""
     users = list(users)
     user_set = set(users)
     print(f"\n== {repo}（{len(users)} 人）==", file=sys.stderr)
+    t_repo, s_repo = time.time(), _snapshot()
     ensure_quota(repo)
 
     # 1. commits：整個 repo 區間內的 commit 列一次，再依作者分
-    print("下載 commits ...", file=sys.stderr)
     commits_by_user = Counter()
-    for c in get_all(f"{API}/repos/{repo}/commits", {"since": f"{since}T00:00:00Z", "until": f"{until}T23:59:59Z"}):
-        login = (c.get("author") or {}).get("login")
-        if login in user_set:
-            commits_by_user[login] += 1
+    if with_commits:
+        print("下載 commits ...", file=sys.stderr)
+        t0, s0 = time.time(), _snapshot()
+        for c in get_all(f"{API}/repos/{repo}/commits", {"since": f"{since}T00:00:00Z", "until": f"{until}T23:59:59Z"}):
+            login = (c.get("author") or {}).get("login")
+            if login in user_set:
+                commits_by_user[login] += 1
+        print(f"  {_elapsed(t0, s0)}", file=sys.stderr)
 
     # 2. 參與的 PR：三種關係（開的、留言的、review 過的）各分批搜，合併去重。
     #    不用 involves:，那會把只是被 @ 提到或被指派的 PR 也撈進來。
     print("搜尋參與的 PR ...", file=sys.stderr)
-    base = f"is:pr repo:{repo} updated:>={since}"
-    seen, items = set(), []
-    n_queries = 0
-    for rel in ("author", "commenter", "reviewed-by"):
-        for batch in user_batches(users, base, rel):
-            n_queries += 1
-            for i in search_users(base, rel, batch):
-                if i["number"] not in seen:
-                    seen.add(i["number"]); items.append(i)
-    prs = [{"number": i["number"], "title": i["title"], "author": i["user"]["login"],
-            "state": i["state"], "created_at": i["created_at"], "url": i["html_url"],
-            "merged_at": (i.get("pull_request") or {}).get("merged_at"),
-            "n_issue_comments": i.get("comments", 0), "author_association": i.get("author_association"),
-            "labels": [l["name"] for l in i.get("labels", [])]} for i in items]
-    print(f"  {n_queries} 次搜尋，{len(prs)} 個 PR", file=sys.stderr)
+    t0, s0 = time.time(), _snapshot()
+    prs, n_queries = search_prs(repo, since, users)
+    print(f"  {n_queries} 次搜尋，{len(prs)} 個 PR，{_elapsed(t0, s0)}", file=sys.stderr)
 
     login = lambda r: (r.get("user") or {}).get("login")
 
@@ -654,12 +712,15 @@ def analyze_repo(repo, users, since, until):
     # 3. 每個 PR 抓一次留言，拆給每個有參與的人。回傳 {user: (mine, own_row, review_row, backport_kind)}
     def process_pr(pr):
         num, author = pr["number"], pr["author"]
-        issue_c = get_all(f"{API}/repos/{repo}/issues/{num}/comments") if pr["n_issue_comments"] else []
-        reviews = get_all(f"{API}/repos/{repo}/pulls/{num}/reviews")
+        cache = PRCache(repo, pr)
+        issue_c = cache.get("issue_comments", lambda: get_all(f"{API}/repos/{repo}/issues/{num}/comments")) \
+            if pr["n_issue_comments"] else []
+        reviews = cache.get("reviews", lambda: get_all(f"{API}/repos/{repo}/pulls/{num}/reviews"))
         # 行內留言一定隸屬於某個 review：有受評者 review 了別人的 PR，或受評者的 PR 被別人 review，才需要抓
         need_inline = any(login(r) in user_set and login(r) != author for r in reviews) or \
             (author in user_set and any(login(r) != author and not is_bot(login(r)) for r in reviews))
-        review_c = get_all(f"{API}/repos/{repo}/pulls/{num}/comments") if need_inline else []
+        review_c = cache.get("review_comments", lambda: get_all(f"{API}/repos/{repo}/pulls/{num}/comments")) \
+            if need_inline else []
 
         # 誰在這個 PR 上有留言
         by_user = {}
@@ -677,7 +738,6 @@ def analyze_repo(repo, users, since, until):
 
         out = {}
         backport = is_backport(pr["title"])
-        pr_commits = None   # 需要時才抓，一個 PR 最多一次
 
         # 3a. review 別人的 PR
         for u, mine in by_user.items():
@@ -691,9 +751,8 @@ def analyze_repo(repo, users, since, until):
             acted = first_rv = False
             if substantive:
                 first = min(c["date"] for c in substantive)
-                if pr_commits is None:
-                    pr_commits = get_all(f"{API}/repos/{repo}/pulls/{num}/commits")
-                acted = any((c["commit"]["committer"]["date"] or "") > first for c in pr_commits)
+                pr_commits = cache.get("commits", lambda: get_all(f"{API}/repos/{repo}/pulls/{num}/commits"))
+                acted =any((c["commit"]["committer"]["date"] or "") > first for c in pr_commits)
                 others_first = [c.get("created_at") or c.get("submitted_at")
                                 for kind, rows in (("review_comment", review_c), ("review", reviews))
                                 for c in rows
@@ -709,14 +768,15 @@ def analyze_repo(repo, users, since, until):
             elif not in_range(pr["created_at"], since, until):
                 out[author] = (mine, None, None, None)
             else:
-                detail, _ = get(f"{API}/repos/{repo}/pulls/{num}")
-                files = get_all(f"{API}/repos/{repo}/pulls/{num}/files")
+                detail = cache.get("detail", lambda: get(f"{API}/repos/{repo}/pulls/{num}")[0])
+                files = cache.get("files", lambda: get_all(f"{API}/repos/{repo}/pulls/{num}/files"))
                 kinds = Counter(classify(f["filename"]) for f in files)
                 others = lambda rows: [r for r in rows if login(r) != author and not is_bot(login(r))]
                 reviewers = Counter(r["user"]["login"] for r in others(reviews))
                 merged_at = detail.get("merged_at")
                 row = {
-                    "number": num, "title": pr["title"], "url": pr["url"], "labels": pr["labels"],
+                    "number": num, "title": pr["title"], "url": pr["url"],
+                    "state": detail.get("state") or pr["state"],
                     "created_at": pr["created_at"], "merged_at": merged_at,
                     "merged_by": (detail.get("merged_by") or {}).get("login"),
                     "hours_to_merge": round(hours_between(pr["created_at"], merged_at), 1) if merged_at else None,
@@ -730,10 +790,12 @@ def analyze_repo(repo, users, since, until):
                 }
                 score(row)
                 out[author] = (mine, row, None, None)
+        cache.save()
         return out
 
     per_user = {u: {"comments": [], "scored": [], "reviewed": [], "backports": Counter()} for u in users}
     print(f"下載 {len(prs)} 個 PR 的留言（{WORKERS} 個 thread）...", file=sys.stderr)
+    t0, s0 = time.time(), _snapshot()
     pool = ThreadPoolExecutor(max_workers=WORKERS)
     try:
         futures = [pool.submit(process_pr, pr) for pr in prs]
@@ -744,12 +806,14 @@ def analyze_repo(repo, users, since, until):
                 if bp: d["backports"][bp] += 1
                 if row: d["scored"].append(row)
                 if rv: d["reviewed"].append(rv)
-            if n % 20 == 0 or n == len(prs):
+            if n % 100 == 0 or n == len(prs):
                 print(f"  {n}/{len(prs)}", file=sys.stderr)
     except KeyboardInterrupt:
         pool.shutdown(wait=False, cancel_futures=True)
         sys.exit("\n已中斷。")
     pool.shutdown()
+    print(f"  {_elapsed(t0, s0)}", file=sys.stderr)
+    print(f"{repo} 合計 {_elapsed(t_repo, s_repo)}", file=sys.stderr)
 
     results = {}
     for u in users:
@@ -777,10 +841,10 @@ def analyze_repo(repo, users, since, until):
 
 
 def quality(rows, what, n, baseline):
-    """回傳 (數值或 None, 說明文字)。rows 已依分數由高到低排序。
-    不足 n 個時缺的名額用 baseline 補。"""
+    """回傳 (數值, 說明文字)。rows 已依分數由高到低排序。
+    不足 n 個時缺的名額用 baseline 補；完全沒有樣本就是 0，不能比有做事的人高。"""
     if not rows:
-        return baseline, f"{baseline:+.2f}（沒有{what.strip()}，全部以基準補）"
+        return 0.0, f"+0.00（沒有{what.strip()}）"
     top = [r["score"] for r in rows[:n]]
     if len(top) >= n:
         v = sum(top) / n
@@ -797,32 +861,33 @@ def median(xs, default):
     return xs[m] if len(xs) % 2 else (xs[m - 1] + xs[m]) / 2
 
 
-def metrics(scored, reviewed, stats, baselines=(BASELINE_PR_DEFAULT, BASELINE_REVIEW_DEFAULT), issues=()):
+def metrics(scored, reviewed, stats, baselines=(BASELINE_PR_DEFAULT, BASELINE_REVIEW_DEFAULT)):
     """從 PR 清單和統計數字算出各分數，單 repo 和跨 repo 合併都用這個。"""
     pr_q, pr_q_text = quality(scored, "PR ", QUALITY_TOP_N_PR, baselines[0])
     rv_depth, rv_depth_text = quality(reviewed, "review ", QUALITY_TOP_N_REVIEW, baselines[1])
     n_sub = sum(1 for r in reviewed if r["substantive"])
     n_ment = sum(1 for r in reviewed if r["mentored"])
-    n_iss_other = sum(1 for r in issues if r["by_other"])
     breadth = (REVIEW_BREADTH["substantive_log"] * math.log2(1 + n_sub)
-               + REVIEW_BREADTH["mentored_log"] * math.log2(1 + n_ment)
-               + REVIEW_BREADTH["issues_by_others_log"] * math.log2(1 + n_iss_other))
+               + REVIEW_BREADTH["mentored_log"] * math.log2(1 + n_ment))
     rv_q = rv_depth + breadth
     rv_q_text = (f"{rv_q:+.2f}　深度 {rv_depth_text}；"
-                 f"廣度 {breadth:+.2f}（實質 review {n_sub} 個、帶非 committer {n_ment} 個、開的題目被別人解掉 {n_iss_other} 個）")
+                 f"廣度 {breadth:+.2f}（實質 review {n_sub} 個、帶非 committer {n_ment} 個）")
     q_total, q_text = pr_q + rv_q, f"{pr_q + rv_q:+.2f}"
-    pr_total = sum(r["score"] for r in scored)
+    imp_total = round(sum(r["counted"] for r in scored if r["important"]), 2)
+    gen_total = round(sum(r["counted"] for r in scored if not r["important"]), 2)
+    pr_total = round(imp_total + gen_total, 2)
     rv_total = round(sum(r["score"] for r in reviewed), 2)
-    iss_total = sum(r["score"] for r in issues)
     merged = sum(1 for r in scored if r["merged_at"])
     return {
-        "pr_total": pr_total, "rv_total": rv_total, "iss_total": iss_total,
-        "total": pr_total + rv_total + iss_total,
-        "n_issues": len(issues), "n_issues_solved": sum(1 for r in issues if r["solved"]), "n_issues_other": n_iss_other,
+        "pr_total": pr_total, "imp_total": imp_total, "gen_total": gen_total,
+        "rv_total": rv_total,
+        "total": round(rv_total + imp_total + gen_total, 2),
         "pr_q": pr_q, "pr_q_text": pr_q_text, "rv_q": rv_q, "rv_q_text": rv_q_text,
         "rv_depth": rv_depth, "rv_breadth": breadth,
         "q_total": q_total, "q_text": q_text,
         "n_pr": len(scored), "n_merged": merged, "n_reviewed": len(reviewed),
+        "n_important": sum(1 for r in scored if r["important"] and r["merged_at"]),
+        "n_open": sum(1 for r in scored if r["pr_state"] == "open"),
         "best_pr": scored[0] if scored else None,
         "best_review": reviewed[0] if reviewed else None,
         "deep_reviews": sum(1 for r in reviewed if r["review_comments"] >= DEEP_REVIEW_INLINE),
@@ -830,18 +895,18 @@ def metrics(scored, reviewed, stats, baselines=(BASELINE_PR_DEFAULT, BASELINE_RE
     }
 
 
-def summary_lines(scored, reviewed, stats, m, title, show_repo=False, issues=()):
+def summary_lines(scored, reviewed, stats, m, title, show_repo=False):
     lines = [
         f"{title}", "",
-        f"數量分：{m['total']:+.2f}",
-        f"- 自己開的 PR：{m['pr_total']:+g}（{m['n_pr']} 個加總）",
+        f"總分：{m['total']:+.2f}",
         f"- Review 別人的 PR：{m['rv_total']:+.2f}（{m['n_reviewed']} 個加總）",
-        f"- 開的題目：{m['iss_total']:+g}（{m['n_issues']} 個加總）", "",
+        f"- 重要 PR：{m['imp_total']:+.2f}（重要性 ≥ {IMPORTANT_PR_MIN:g} 的 PR，已 merge {m['n_important']} 個）",
+        f"- 一般 PR：{m['gen_total']:+.2f}（乘 {PR_BUCKET_FACTOR['general']:g}；未 merge 再乘 {PR_STATE_FACTOR['open']:g}，關掉不計）", "",
         f"品質分：{m['q_text']}",
         f"- 自己開的 PR：{m['pr_q_text']}",
         f"- Review 別人的 PR：{m['rv_q_text']}", "",
         f"- Commits：{stats['commits']}",
-        f"- 自己開的 PR：{m['n_pr']}（已 merge：{m['n_merged']}）"
+        f"- 自己開的 PR：{m['n_pr']}（已 merge：{m['n_merged']}，其中重要 {m['n_important']}；還開著：{m['n_open']}）"
         + (f"，最佳 PR：{m['best_pr']['score']:+g}（#{m['best_pr']['number']} {m['best_pr']['title']}）" if m["best_pr"] else ""),
         f"- 有留言的 PR 數：{stats['comment_prs']}",
         f"- 一般留言（issue comment）：{stats['issue_comments']}",
@@ -853,15 +918,16 @@ def summary_lines(scored, reviewed, stats, m, title, show_repo=False, issues=())
         f"- 帶非 committer（留 {MENTOR_MIN_INLINE} 則以上意見或 request changes、最後 merge）：{stats['mentored']} 個",
         f"- Review 後 PR 有更新（review 起作用）：{stats['reviewed_acted']} 個",
         f"- 第一個留實質意見的 PR：{stats['reviewed_first']} 個",
-        f"- 深度 review（行內 {DEEP_REVIEW_INLINE} 則以上）：{m['deep_reviews']} 個"
+        f"- 深度 review（行內 {DEEP_REVIEW_INLINE} 則以上，每個 +{REVIEW_WEIGHTS['deep_review']:g}）：{m['deep_reviews']} 個"
         + (f"，最佳 review：{m['best_review']['score']:+.1f}（#{m['best_review']['number']} {m['best_review']['title']}）" if m["best_review"] else ""),
-        f"- 開的題目：{m['n_issues']} 個（已解掉 {m['n_issues_solved']}，其中被別人解掉 {m['n_issues_other']}）",
     ]
     tag = (lambda r: f"{r['repo']} " if show_repo else "")
     if scored:
-        lines += ["", "自己開的 PR 評分（由高到低）", ""]
+        lines += ["", "自己開的 PR 評分（由高到低；[重要性 → 計入總分]）", ""]
         for r in scored:
-            lines.append(f"- [{r['score']:+g}] {tag(r)}#{r['number']} {r['title']}"
+            kind = "重要" if r["important"] else "一般"
+            st = {"merged": "", "open": "、未 merge", "closed": "、已關閉"}[r["pr_state"]]
+            lines.append(f"- [{r['score']:+g} → {r['counted']:+g} {kind}{st}] {tag(r)}#{r['number']} {r['title']}"
                          f"　（{', '.join(r['score_reasons']) or '無加減分'}）")
     if reviewed:
         lines += ["", "Review 過的 PR 評分（由高到低）", ""]
@@ -869,11 +935,6 @@ def summary_lines(scored, reviewed, stats, m, title, show_repo=False, issues=())
             detail = (f"行內 {r['review_comments']}、一般 {r['issue_comments']}、結論 {r['reviews']}"
                       + (f"、{', '.join(r['score_reasons'])}" if r["score_reasons"] else ""))
             lines.append(f"- [{r['score']:+.2f}] {tag(r)}#{r['number']} {r['title']}　（{detail}）")
-    if issues:
-        lines += ["", "開的題目評分（由高到低）", ""]
-        for r in issues:
-            lines.append(f"- [{r['score']:+g}] {r['key']} {r['title']}　（{r['resolution']}"
-                         + (f"，{', '.join(r['score_reasons'])}" if r["score_reasons"] else "") + "）")
     return lines
 
 
@@ -910,13 +971,12 @@ def main():
     ap.add_argument("--config", help="JSON 設定檔的路徑或 http(s) 網址，多個人 × 多個 repo")
     ap.add_argument("--repo", help="單人模式：owner/repo 或 https://github.com/owner/repo")
     ap.add_argument("--user", help="單人模式：GitHub 帳號")
-    ap.add_argument("--jira", help="單人模式：JIRA 帳號（repo 用 JIRA 時才需要）")
     ap.add_argument("--since", help="YYYY-MM-DD，預設為 60 天前（--config 內的設定優先）")
     ap.add_argument("--until", help="YYYY-MM-DD，預設為今天")
     ap.add_argument("--detail", action="store_true", help="總表之後再印每個人的明細（預設只印總表）")
     ap.add_argument("--format", choices=["text", "markdown"], default="text",
                     help="輸出格式：text（預設，terminal / Jenkins console 好讀）或 markdown")
-    ap.add_argument("--no-cache", action="store_true", help="不使用 ETag 快取")
+    ap.add_argument("--no-cache", action="store_true", help="不使用快取（ETag 和每個 PR 的原始資料都不用）")
     ap.add_argument("--cache-dir", help="快取目錄，預設 ~/.cache/gh_activity")
     a = ap.parse_args()
     _cache_enabled = not a.no_cache
@@ -937,20 +997,16 @@ def main():
     if a.config:
         cfg = load_config(a.config)
         since, until = cfg.get("since") or a.since, cfg.get("until") or a.until
-        repo_jira = dict(REPO_JIRA, **{normalize_repo(k): v for k, v in (cfg.get("jira_projects") or {}).items()})
         if "users" in cfg:
             # 新格式：每個人都查全部 repo
             repos = [normalize_repo(r) for r in cfg["repos"]]
-            jira_users = dict(cfg.get("jira") or {})
-            people = [{"user": u, "jira": jira_users.get(u), "repos": repos} for u in cfg["users"]]
+            people = [{"user": u, "repos": repos} for u in cfg["users"]]
         else:
             # 舊格式：每個人各自列 repo
-            people = [{"user": p["user"], "jira": p.get("jira"), "repos": [normalize_repo(r) for r in p["repos"]]}
-                      for p in cfg["people"]]
+            people = [{"user": p["user"], "repos": [normalize_repo(r) for r in p["repos"]]} for p in cfg["people"]]
     elif a.repo and a.user:
-        people = [{"user": a.user, "jira": a.jira, "repos": [normalize_repo(a.repo)]}]
+        people = [{"user": a.user, "repos": [normalize_repo(a.repo)]}]
         since, until = a.since, a.until
-        repo_jira = dict(REPO_JIRA)
     else:
         ap.error("請給 --config，或同時給 --repo 與 --user")
     today = datetime.now(timezone.utc).date()
@@ -962,32 +1018,32 @@ def main():
     for p in people:
         for repo in p["repos"]:
             repo_users.setdefault(repo, []).append(p["user"])
-    jira_users = {p["user"]: p["jira"] for p in people if p.get("jira")}
 
     first = next((r for r, us in repo_users.items() if len(us) >= 2), None)
     if first:
         verify_or_semantics(first, since, repo_users[first])
 
-    # 逐 repo 抓
+    # 逐 repo 抓。commit 數只有 --detail 和單人單 repo 的輸出會用到
+    with_commits = a.detail or (len(people) == 1 and len(people[0]["repos"]) == 1)
+    t_all, s_all = time.time(), _snapshot()
     results_by_user = {p["user"]: [] for p in people}
     skipped = {}
     for repo, users in repo_users.items():
         try:
-            for u, res in analyze_repo(repo, users, since, until).items():
+            for u, res in analyze_repo(repo, users, since, until, with_commits).items():
                 results_by_user[u].append(res)
         except RepoInaccessible as e:
             print(f"  跳過：{e}", file=sys.stderr)
             skipped[repo] = users
     for repo in skipped:
         repo_users.pop(repo)
-    issues_by_user = fetch_all_issues(repo_users, jira_users, since, until, repo_jira)
+    print(f"\n全部 {len(repo_users)} 個 repo 合計 {_elapsed(t_all, s_all)}\n", file=sys.stderr)
 
     fetched = []
     for p in people:
         results = results_by_user[p["user"]]
         p["skipped"] = [r for r, us in skipped.items() if p["user"] in us]
         if results:
-            p["issues"] = issues_by_user.get(p["user"], [])
             fetched.append((p, results))
         else:
             print(f"  {p['user']} 沒有任何可存取的 repo，略過", file=sys.stderr)
@@ -1003,47 +1059,52 @@ def main():
     rows = []   # (person, combined metrics, per-repo results, ...)
     for p, results in fetched:
         scored, reviewed, stats = combine(results)
-        m = metrics(scored, reviewed, stats, baselines, p["issues"])
+        m = metrics(scored, reviewed, stats, baselines)
         per_repo = {r["repo"]: metrics(r["scored"], r["reviewed"], r, baselines)["total"] for r in results}
         m["main_repo"] = max(per_repo, key=per_repo.get)
         m["main_repo_total"] = per_repo[m["main_repo"]]
+        if m["main_repo_total"] <= 0:
+            m["main_repo"] = None   # 完全沒活動，不要顯示成第一個 repo
         rows.append((p, m, results, scored, reviewed, stats))
 
     # 單人單 repo：維持原本的輸出格式
     if len(rows) == 1 and len(rows[0][2]) == 1:
         p, m, results, scored, reviewed, stats = rows[0]
         lines = summary_lines(scored, reviewed, stats, m,
-                              f"# {p['user']} @ {results[0]['repo']}\n區間：{since} ~ {until}", issues=p["issues"])
+                              f"# {p['user']} @ {results[0]['repo']}\n區間：{since} ~ {until}")
         print(render(lines, a.format))
         return
 
     # 多人：總表 + 每人明細
     rows.sort(key=lambda x: -x[1]["total"])
     out = [f"# 評比結果", f"區間：{since} ~ {until}",
-           f"品質分基準值（樣本不足時補入）：PR {baselines[0]:.2f}、review {baselines[1]:.2f}（全體中位數）", "",
-           "## 總表（依數量分排序）", "",
-           "| 人 | 數量分 | 品質分 | PR（merge） | Review PR | 深度 review | 帶非 committer | 開題目（被別人解） | 主要 repo |",
-           "|---|---|---|---|---|---|---|---|---|"]
+           f"總分 = review + 重要 PR + 一般 PR。重要 PR：重要性 ≥ {IMPORTANT_PR_MIN:g}；"
+           f"一般 PR 乘 {PR_BUCKET_FACTOR['general']:g}；未 merge 的 PR 乘 {PR_STATE_FACTOR['open']:g}，關掉不計",
+           f"品質分基準值（樣本不足時補入）：PR {baselines[0]:.2f}、review {baselines[1]:.2f}（全體中位數）；沒有活動就是 0", "",
+           "## 總表（依總分排序）", "",
+           "| 人 | 總分 | review | 重要 PR | 一般 PR | 品質分 | PR merge/開 | 重要 | Review PR | 深度 | 帶非 committer | 主要 repo |",
+           "|---|---|---|---|---|---|---|---|---|---|---|---|"]
     if skipped:
         out.insert(3, "無法存取而跳過的 repo：" + "、".join(skipped))
     for p, m, results, scored, reviewed, stats in rows:
-        out.append(f"| {p['user']} | {m['total']:+.1f} | {fmt(m['q_total'])} | {m['n_pr']}（{m['n_merged']}） "
+        main = f"{m['main_repo']}（{m['main_repo_total']:+.1f}）" if m["main_repo"] else "無"
+        out.append(f"| {p['user']} | {m['total']:+.1f} | {m['rv_total']:+.1f} | {m['imp_total']:+.1f} "
+                   f"| {m['gen_total']:+.1f} | {fmt(m['q_total'])} "
+                   f"| {m['n_merged']}/{m['n_pr']} | {m['n_important']} "
                    f"| {m['n_reviewed']} | {m['deep_reviews']} | {stats['mentored']} "
-                   f"| {m['n_issues']}（{m['n_issues_other']}） "
-                   f"| {m['main_repo']}（{m['main_repo_total']:+.1f}） |")
+                   f"| {main} |")
     out += ["", "品質分排序：" + " > ".join(
         f"{p['user']}（{fmt(m['q_total'])}）" for p, m, *_ in sorted(rows, key=lambda x: -(x[1]["q_total"] or -1e9)))]
     if a.detail:
         for p, m, results, scored, reviewed, stats in rows:
             out += ["", "---", "", f"## {p['user']}", ""]
             if len(results) > 1:
-                out += summary_lines(scored, reviewed, stats, m, f"### 合計（{', '.join(p['repos'])}）",
-                                     show_repo=True, issues=p["issues"])
+                out += summary_lines(scored, reviewed, stats, m, f"### 合計（{', '.join(p['repos'])}）", show_repo=True)
                 for res in results:
                     rm = metrics(res["scored"], res["reviewed"], res, baselines)
                     out += [""] + summary_lines(res["scored"], res["reviewed"], res, rm, f"### {res['repo']}")
             else:
-                out += summary_lines(scored, reviewed, stats, m, f"### {results[0]['repo']}", issues=p["issues"])
+                out += summary_lines(scored, reviewed, stats, m, f"### {results[0]['repo']}")
     print(render(out, a.format))
 
 
