@@ -678,23 +678,26 @@ class PRCache:
 def analyze_repo(repo, users, since, until, with_commits=True):
     """抓一群人在一個 repo 的活動，回傳 {user: 統計結果}。
     搜尋是分批合併查的，每個 PR 的留言只抓一次，再拆給有參與的人。
-    with_commits=False 時跳過 commits（commit 數只在 --detail 和單人模式才會印，總表用不到）。"""
+    with_commits 目前保留參數但一律會抓 commits（判斷關掉但有進 default branch 的 PR 要用）。"""
     users = list(users)
     user_set = set(users)
     print(f"\n== {repo}（{len(users)} 人）==", file=sys.stderr)
     t_repo, s_repo = time.time(), _snapshot()
     ensure_quota(repo)
 
-    # 1. commits：整個 repo 區間內的 commit 列一次，再依作者分
+    # 1. commits：整個 repo 區間內的 commit 列一次，再依作者分。
+    #    同時記下訊息裡提到的 PR 編號（#123），給「關掉但其實有進 default branch」的 PR 判斷用。
     commits_by_user = Counter()
-    if with_commits:
-        print("下載 commits ...", file=sys.stderr)
-        t0, s0 = time.time(), _snapshot()
-        for c in get_all(f"{API}/repos/{repo}/commits", {"since": f"{since}T00:00:00Z", "until": f"{until}T23:59:59Z"}):
-            login = (c.get("author") or {}).get("login")
-            if login in user_set:
-                commits_by_user[login] += 1
-        print(f"  {_elapsed(t0, s0)}", file=sys.stderr)
+    closed_by_commit = {}   # PR 編號 → 提到它的 commit（區間內、default branch）
+    print("下載 commits ...", file=sys.stderr)
+    t0, s0 = time.time(), _snapshot()
+    for c in get_all(f"{API}/repos/{repo}/commits", {"since": f"{since}T00:00:00Z", "until": f"{until}T23:59:59Z"}):
+        login = (c.get("author") or {}).get("login")
+        if login in user_set:
+            commits_by_user[login] += 1
+        for n in re.findall(r"(?<![\w/])#(\d+)(?!\d)", (c.get("commit") or {}).get("message") or ""):
+            closed_by_commit.setdefault(int(n), c)
+    print(f"  {_elapsed(t0, s0)}", file=sys.stderr)
 
     # 2. 參與的 PR：三種關係（開的、留言的、review 過的）各分批搜，合併去重。
     #    不用 involves:，那會把只是被 @ 提到或被指派的 PR 也撈進來。
@@ -739,6 +742,27 @@ def analyze_repo(repo, users, since, until, with_commits=True):
         out = {}
         backport = is_backport(pr["title"])
 
+        # 有些專案（例如 YuniKorn）不是按 merge 按鈕，而是用工具把 commit 推上 default branch，
+        # PR 被 commit 訊息裡的 "Closes #N" 自動關掉，GitHub 上狀態是 closed 而不是 merged。
+        # 這種 PR 的 closed 事件會帶 commit_id，視同 merged。只對有人參與的 closed 未 merge PR 查一次。
+        pr = dict(pr)
+        if pr["state"] == "closed" and not pr["merged_at"] and \
+                (author in user_set or any(u != author for u in by_user)):
+            c = closed_by_commit.get(num)
+            if c:
+                # 區間內 default branch 上有 commit 提到這個 PR 編號
+                pr["merged_at"] = ((c.get("commit") or {}).get("committer") or {}).get("date")
+                pr["merged_by"] = (c.get("committer") or {}).get("login")
+                pr["merged_via_commit"] = True
+            else:
+                # 沒有的話看 PR 的 closed 事件是否帶 commit_id（被 commit 訊息裡的 Closes #N 自動關掉）
+                events = cache.get("events", lambda: get_all(f"{API}/repos/{repo}/issues/{num}/events"))
+                closed = [e for e in events if e.get("event") == "closed" and e.get("commit_id")]
+                if closed:
+                    pr["merged_at"] = closed[-1].get("created_at")
+                    pr["merged_by"] = (closed[-1].get("actor") or {}).get("login")
+                    pr["merged_via_commit"] = True
+
         # 3a. review 別人的 PR
         for u, mine in by_user.items():
             if u == author:
@@ -773,12 +797,13 @@ def analyze_repo(repo, users, since, until, with_commits=True):
                 kinds = Counter(classify(f["filename"]) for f in files)
                 others = lambda rows: [r for r in rows if login(r) != author and not is_bot(login(r))]
                 reviewers = Counter(r["user"]["login"] for r in others(reviews))
-                merged_at = detail.get("merged_at")
+                merged_at = detail.get("merged_at") or pr["merged_at"]
                 row = {
                     "number": num, "title": pr["title"], "url": pr["url"],
                     "state": detail.get("state") or pr["state"],
                     "created_at": pr["created_at"], "merged_at": merged_at,
-                    "merged_by": (detail.get("merged_by") or {}).get("login"),
+                    "merged_by": (detail.get("merged_by") or {}).get("login") or pr.get("merged_by"),
+                    "merged_via_commit": pr.get("merged_via_commit", False),
                     "hours_to_merge": round(hours_between(pr["created_at"], merged_at), 1) if merged_at else None,
                     "additions": detail.get("additions"), "deletions": detail.get("deletions"),
                     "changed_files": detail.get("changed_files"),
@@ -926,7 +951,8 @@ def summary_lines(scored, reviewed, stats, m, title, show_repo=False):
         lines += ["", "自己開的 PR 評分（由高到低；[重要性 → 計入總分]）", ""]
         for r in scored:
             kind = "重要" if r["important"] else "一般"
-            st = {"merged": "", "open": "、未 merge", "closed": "、已關閉"}[r["pr_state"]]
+            st = {"merged": "、commit 進 default branch" if r.get("merged_via_commit") else "",
+                  "open": "、未 merge", "closed": "、已關閉"}[r["pr_state"]]
             lines.append(f"- [{r['score']:+g} → {r['counted']:+g} {kind}{st}] {tag(r)}#{r['number']} {r['title']}"
                          f"　（{', '.join(r['score_reasons']) or '無加減分'}）")
     if reviewed:
@@ -1023,8 +1049,8 @@ def main():
     if first:
         verify_or_semantics(first, since, repo_users[first])
 
-    # 逐 repo 抓。commit 數只有 --detail 和單人單 repo 的輸出會用到
-    with_commits = a.detail or (len(people) == 1 and len(people[0]["repos"]) == 1)
+    # 逐 repo 抓。commit 清單一律要抓（判斷「關掉但有進 default branch」的 PR 要用）
+    with_commits = True
     t_all, s_all = time.time(), _snapshot()
     results_by_user = {p["user"]: [] for p in people}
     skipped = {}
@@ -1079,7 +1105,8 @@ def main():
     rows.sort(key=lambda x: -x[1]["total"])
     out = [f"# 評比結果", f"區間：{since} ~ {until}",
            f"總分 = review + 重要 PR + 一般 PR。重要 PR：重要性 ≥ {IMPORTANT_PR_MIN:g}；"
-           f"一般 PR 乘 {PR_BUCKET_FACTOR['general']:g}；未 merge 的 PR 乘 {PR_STATE_FACTOR['open']:g}，關掉不計",
+           f"一般 PR 乘 {PR_BUCKET_FACTOR['general']:g}；未 merge 的 PR 乘 {PR_STATE_FACTOR['open']:g}，關掉不計"
+           f"（關掉但有 commit 進 default branch 的，例如 YuniKorn 的合併方式，視同 merge）",
            f"品質分基準值（樣本不足時補入）：PR {baselines[0]:.2f}、review {baselines[1]:.2f}（全體中位數）；沒有活動就是 0", "",
            "## 總表（依總分排序）", "",
            "| 人 | 總分 | review | 重要 PR | 一般 PR | 品質分 | PR merge/開 | 重要 | Review PR | 深度 | 帶非 committer | 主要 repo |",
@@ -1093,8 +1120,27 @@ def main():
                    f"| {m['n_merged']}/{m['n_pr']} | {m['n_important']} "
                    f"| {m['n_reviewed']} | {m['deep_reviews']} | {stats['mentored']} "
                    f"| {main} |")
-    out += ["", "品質分排序：" + " > ".join(
-        f"{p['user']}（{fmt(m['q_total'])}）" for p, m, *_ in sorted(rows, key=lambda x: -(x[1]["q_total"] or -1e9)))]
+    out += ["", f"## 全體活動量（{len(rows)} 人加總，原始數字不計分）", "",
+            "| repo | 開的 PR | 已 merge | 還開著 | Review 過的 PR | 留言總數 | Review 非 committer（新人） | 帶非 committer |",
+            "|---|---|---|---|---|---|---|---|"]
+    by_repo = {}
+    for p, m, results, scored, reviewed, stats in rows:
+        for res in results:
+            g = by_repo.setdefault(res["repo"], {"n_pr": 0, "n_merged": 0, "n_open": 0, "n_reviewed": 0,
+                                                 **{k: 0 for k in STAT_KEYS}})
+            g["n_pr"] += len(res["scored"])
+            g["n_merged"] += sum(1 for r in res["scored"] if r["merged_at"])
+            g["n_open"] += sum(1 for r in res["scored"] if r["pr_state"] == "open")
+            g["n_reviewed"] += len(res["reviewed"])
+            for k in STAT_KEYS:
+                g[k] += res[k]
+    groups = list(by_repo.items())
+    if len(groups) > 1:
+        total = {k: sum(g[k] for g in by_repo.values()) for k in groups[0][1]}
+        groups.append(("合計", total))
+    for name, g in groups:
+        out.append(f"| {name} | {g['n_pr']} | {g['n_merged']} | {g['n_open']} | {g['n_reviewed']} | {g['comments_total']} "
+                   f"| {g['reviewed_noncommitter']}（{g['reviewed_newcomer']}） | {g['mentored']} |")
     if a.detail:
         for p, m, results, scored, reviewed, stats in rows:
             out += ["", "---", "", f"## {p['user']}", ""]
